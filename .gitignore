@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build & TypeScript outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Local runtime & SQLite save files
+.cache/
+saves/
+projects/
+tmp/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# OS & Editor files
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Environment secrets
+.env
+.env.*
+!.env.example

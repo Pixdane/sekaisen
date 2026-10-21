@@ -1,0 +1,27 @@
+{
+  "name": "sekaisen-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "biome check packages tests",
+    "format": "biome check --write packages tests"
+  },
+  "dependencies": {
+    "@sekaisen/core": "workspace:*",
+    "@sekaisen/plugin-world": "workspace:*",
+    "@noble/hashes": "2.0.1",
+    "cordis": "4.0.0-rc.11"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@types/bun": "1.3.14",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

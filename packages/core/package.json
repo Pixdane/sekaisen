@@ -1,0 +1,8 @@
+{
+  "name": "@sekaisen/core",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "exports": "./src/index.ts",
+  "dependencies": { "@noble/hashes": "2.0.1" }
+}
