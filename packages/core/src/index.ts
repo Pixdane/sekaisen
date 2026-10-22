@@ -5,14 +5,32 @@ import { bytesToHex } from '@noble/hashes/utils.js'
 /*                              Option<T>                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Non-exported nominal marker carried by every real {@link Option} value.
+ * It is installed as a non-enumerable own symbol, so user data shaped like
+ * `{ kind: 'none' }` or `{ kind: 'some', value }` never becomes an `Option`.
+ */
+const OPTION_MARKER: unique symbol = Symbol('sekaisen.option')
+
 /** Present variant of {@link Option}. */
 export interface Some<T> {
   readonly kind: 'some'
   readonly value: T
+  readonly [OPTION_MARKER]: true
+}
+
+function markOption<T extends object>(value: T): T & { readonly [OPTION_MARKER]: true } {
+  Object.defineProperty(value, OPTION_MARKER, {
+    value: true,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  })
+  return Object.freeze(value) as T & { readonly [OPTION_MARKER]: true }
 }
 
 /** Frozen singleton representing an absent {@link Option} value. */
-export const NONE = Object.freeze({ kind: 'none' } as const)
+export const NONE = markOption({ kind: 'none' } as const)
 /** Type of the absent {@link NONE} singleton. */
 export type None = typeof NONE
 
@@ -21,7 +39,20 @@ export type Option<T> = Some<T> | None
 
 /** Wrap `value` in a frozen {@link Some} container. */
 export function some<T>(value: T): Some<T> {
-  return Object.freeze({ kind: 'some', value })
+  return markOption({ kind: 'some' as const, value })
+}
+
+/**
+ * Runtime check for a genuine {@link Option} created by {@link some} or
+ * {@link NONE}. Same-shaped business data is rejected.
+ */
+export function isOption(value: unknown): value is Option<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    Object.hasOwn(value, OPTION_MARKER) &&
+    Reflect.get(value, OPTION_MARKER) === true
+  )
 }
 
 /** Type guard that narrows an {@link Option} to {@link Some}. */

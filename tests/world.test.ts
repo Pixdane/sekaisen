@@ -578,3 +578,20 @@ test('invalid values, paths and missing refs stay in the controlled error channe
   ).toMatchObject({ ok: false, error: { kind: 'dangling_ref' } })
   expect(unwrap(world.getChildren(root.id))).toEqual([])
 })
+
+test('getReferencingCommits tracks live incoming StateRefs and clears on popLeaf', () => {
+  const { world } = setup()
+  const w1 = commit(world, null, [{ op: 'set', path: ['state'], value: 'v1' }], 'w1')
+  expect(unwrap(world.getReferencingCommits(w1.id))).toEqual([])
+  const trace = commit(
+    world,
+    null,
+    [{ op: 'ref', path: ['worldNode'], ref: { commitId: w1.id, path: [] } }],
+    'trace',
+  )
+  const refs = unwrap(world.getReferencingCommits(w1.id))
+  expect(refs).toEqual([trace.id])
+  expect(Object.isFrozen(refs)).toBe(true)
+  expect(world.popLeaf(trace.id)).toEqual({ ok: true, value: undefined })
+  expect(unwrap(world.getReferencingCommits(w1.id))).toEqual([])
+})

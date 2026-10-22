@@ -267,6 +267,14 @@ export class WorldService extends Service<WorldConfig> {
     return this.attempt(() => Object.freeze([...this.requireCommit(id).children]))
   }
 
+  /** Return all live commit hashes that reference `id` via `StateRef`. */
+  getReferencingCommits(id: CommitHash): Result<readonly CommitHash[], WorldError> {
+    return this.attempt(() => {
+      this.requireCommit(id)
+      return Object.freeze([...(this.storage.pins.get(id) ?? [])])
+    })
+  }
+
   /** Return `true` if `id` exists in the commit forest. */
   hasCommit(id: CommitHash): boolean {
     return this.storage.commits.has(id)

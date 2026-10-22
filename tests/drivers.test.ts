@@ -78,7 +78,7 @@ describe('SQLite driver contract', () => {
 
       expect(
         driver.prepare('SELECT name FROM items WHERE id = ?').get<{ name: string }>(1),
-      ).toEqual({ kind: 'some', value: { name: 'alpha' } })
+      ).toEqual(some({ name: 'alpha' }))
       expect(
         driver
           .prepare('SELECT name FROM items ORDER BY id')
