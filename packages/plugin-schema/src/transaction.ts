@@ -4,11 +4,10 @@ import type { CommitHash, Path, StateRef, Value } from '@sekaisen/plugin-world'
 import { encodePathKey } from '@sekaisen/plugin-world'
 import { assertIdentifier, cloneSchema, cloneSchemaMetadata, SchemaFailure } from './builders.ts'
 import { getLensRoot, getLensRoute } from './optics.ts'
-import type { Catalog, Snapshot } from './runtime.ts'
+import type { Catalog, Snapshot, StateReader } from './runtime.ts'
 import {
   deleteTree,
   failValidation,
-  getEntry,
   hasNode,
   physicalSchemaAt,
   readCustomSpec,
@@ -58,13 +57,13 @@ interface Resolution {
   writer: SchemaNode | undefined
   virtual: boolean
 }
-export class ReadView implements ReadonlySchemaView {
-  protected readonly snapshot: Snapshot
+export class ReadView<TState extends StateReader = StateReader> implements ReadonlySchemaView {
+  protected readonly state: TState
   protected readonly writer: Catalog
   protected readonly reader: Catalog
   protected readonly commitId: CommitHash
-  constructor(snapshot: Snapshot, writer: Catalog, reader: Catalog, commitId: CommitHash) {
-    this.snapshot = snapshot
+  constructor(state: TState, writer: Catalog, reader: Catalog, commitId: CommitHash) {
+    this.state = state
     this.writer = writer
     this.reader = reader
     this.commitId = commitId
@@ -81,9 +80,9 @@ export class ReadView implements ReadonlySchemaView {
     let entry = false
     const route = getLensRoute(lens)
     for (let index = 0; ; index++) {
-      const state = resolvePresence(this.snapshot, at, spec, writer, this.commitId, virtual, entry)
-      if (state === 'absent') return undefined
-      virtual = state === 'virtual'
+      const presence = resolvePresence(this.state, at, spec, writer, this.commitId, virtual, entry)
+      if (presence === 'absent') return undefined
+      virtual = presence === 'virtual'
       const step = route[index]
       if (!step) break
       if (step.kind === 'field' && spec.nodeKind === 'struct') {
@@ -115,9 +114,8 @@ export class ReadView implements ReadonlySchemaView {
           'Custom key shadows a formal field',
         )
       }
-      if (virtual || !getEntry(this.snapshot, [...lens.path, '$spec', 'valueKind']))
-        return undefined
-      const customSpec = readCustomSpec(this.snapshot, lens.path, this.commitId)
+      if (virtual || !this.state.hasEntry([...lens.path, '$spec', 'valueKind'])) return undefined
+      const customSpec = readCustomSpec(this.state, lens.path, this.commitId)
       if (lens.opticKind === 'custom' && lens.expectedSchema.valueKind !== customSpec.valueKind) {
         throw new SchemaFailure({
           kind: 'schema_type_mismatch',
@@ -147,7 +145,7 @@ export class ReadView implements ReadonlySchemaView {
       if (!resolved) return NONE
       // Resolution has already applied the existence matrix, including Map member short-circuiting.
       const result = readNode(
-        this.snapshot,
+        this.state,
         resolved.path,
         resolved.reader,
         resolved.writer,
@@ -166,7 +164,7 @@ export class ReadView implements ReadonlySchemaView {
       if (resolved.reader.nodeKind !== 'leaf')
         failValidation(lens.path, 'type_mismatch', 'Expected a leaf')
       const value = readNode(
-        this.snapshot,
+        this.state,
         resolved.path,
         resolved.reader,
         resolved.writer,
@@ -177,7 +175,7 @@ export class ReadView implements ReadonlySchemaView {
       return some(
         Object.freeze({
           value: value.value as LeafValueTypeMap[TLeaf['valueKind']],
-          meta: resolved.virtual ? Object.freeze({}) : readMeta(this.snapshot, lens.path),
+          meta: resolved.virtual ? Object.freeze({}) : readMeta(this.state, lens.path),
           spec: cloneSchema(resolved.reader) as LeafSchemaNode,
         }),
       )
@@ -191,18 +189,12 @@ export class ReadView implements ReadonlySchemaView {
       if (!resolved) return NONE
       if (resolved.reader.nodeKind !== 'leaf')
         failValidation(lens.path, 'type_mismatch', 'Expected custom leaf')
-      const value = readNode(
-        this.snapshot,
-        lens.path,
-        resolved.reader,
-        resolved.writer,
-        this.commitId,
-      )
+      const value = readNode(this.state, lens.path, resolved.reader, resolved.writer, this.commitId)
       if (value.kind === 'none') return NONE
       return some(
         Object.freeze({
           value: value.value as Value | StateRef,
-          meta: readMeta(this.snapshot, lens.path),
+          meta: readMeta(this.state, lens.path),
           spec: cloneSchema(resolved.reader) as LeafSchemaNode,
         }),
       )
@@ -225,7 +217,7 @@ export class ReadView implements ReadonlySchemaView {
   }
 }
 
-export class Transaction extends ReadView {
+export class Transaction extends ReadView<Snapshot> {
   private active = true
   finish(): void {
     this.active = false
@@ -253,7 +245,7 @@ export class Transaction extends ReadView {
     let at: Path = root
     let spec = this.reader.roots.get(encodePathKey(root))?.schema
     for (const step of route) {
-      if (!spec || !hasNode(this.snapshot, at, spec))
+      if (!spec || !hasNode(this.state, at, spec))
         failValidation(at, 'instance_not_found', 'Ancestor container does not exist')
       if (spec.nodeKind === 'struct') spec = spec.fields[step.key]
       else if (spec.nodeKind === 'map') spec = spec.valueSchema
@@ -266,7 +258,7 @@ export class Transaction extends ReadView {
     if (lens.opticKind === 'custom') {
       const spec = this.customSpec(lens)
       validateValue(spec, input, lens.path)
-      setValue(this.snapshot, [...lens.path, '$val'], input, spec.valueKind === 'ref')
+      setValue(this.state, [...lens.path, '$val'], input, spec.valueKind === 'ref')
       return
     }
     this.checkAncestors(lens)
@@ -275,12 +267,12 @@ export class Transaction extends ReadView {
     if (input === null) {
       if (lens.schema.presence.mode !== 'optional')
         failValidation(lens.path, 'cannot_delete_non_optional_node', 'Node is not deletable')
-      deleteTree(this.snapshot, lens.path)
+      deleteTree(this.state, lens.path)
       return
     }
     const writeSpec: SchemaNode = { ...spec, presence: { mode: 'required' } }
     writeNode(
-      this.snapshot,
+      this.state,
       lens.path,
       writeSpec,
       input,
@@ -298,13 +290,13 @@ export class Transaction extends ReadView {
     const metadata = cloneSchemaMetadata(meta)
     this.set(lens, input)
     for (const [key, value] of Object.entries(metadata)) {
-      if (value === null) deleteTree(this.snapshot, [...lens.path, '$meta', key])
-      else setValue(this.snapshot, [...lens.path, '$meta', key], value)
+      if (value === null) deleteTree(this.state, [...lens.path, '$meta', key])
+      else setValue(this.state, [...lens.path, '$meta', key], value)
     }
   }
   patch(lens: StructLens, input: Readonly<Record<string, unknown>>): void {
     this.checkActive()
-    if (!hasNode(this.snapshot, lens.path, lens.schema))
+    if (!hasNode(this.state, lens.path, lens.schema))
       failValidation(lens.path, 'instance_not_found', 'Struct does not exist')
     if (input === null || typeof input !== 'object' || Array.isArray(input))
       failValidation(lens.path, 'type_mismatch', 'Patch must be a dictionary')
@@ -336,7 +328,7 @@ export class Transaction extends ReadView {
     const spec = this.activeSpec(lens)
     if (spec.nodeKind !== 'struct' || !spec.allowCustom)
       failValidation(lens.path, 'custom_not_allowed_on_struct', 'Struct is not extensible')
-    if (!hasNode(this.snapshot, lens.path, spec))
+    if (!hasNode(this.state, lens.path, spec))
       failValidation(lens.path, 'instance_not_found', 'Struct does not exist')
     const writer = physicalSchemaAt(this.writer, lens.path)
     if (
@@ -349,25 +341,25 @@ export class Transaction extends ReadView {
       failValidation(lens.path, 'type_mismatch', 'Custom schema must be a leaf')
     validateValue(leaf, input, lens.path)
     const custom = lens.custom(key, node)
-    if (getEntry(this.snapshot, [...custom.path, '$spec', 'valueKind'])) {
-      const old = readCustomSpec(this.snapshot, custom.path, this.commitId)
+    if (this.state.hasEntry([...custom.path, '$spec', 'valueKind'])) {
+      const old = readCustomSpec(this.state, custom.path, this.commitId)
       if (old.valueKind !== node.valueKind)
         failValidation(custom.path, 'type_mismatch', 'Cannot redefine custom value kind')
     }
     const metadata = meta === undefined ? undefined : cloneSchemaMetadata(meta)
-    writeCustomSpec(this.snapshot, custom.path, leaf)
-    setValue(this.snapshot, [...custom.path, '$val'], input, leaf.valueKind === 'ref')
+    writeCustomSpec(this.state, custom.path, leaf)
+    setValue(this.state, [...custom.path, '$val'], input, leaf.valueKind === 'ref')
     if (metadata)
       for (const [attr, value] of Object.entries(metadata))
-        setValue(this.snapshot, [...custom.path, '$meta', attr], value)
+        setValue(this.state, [...custom.path, '$meta', attr], value)
     return custom
   }
   overwriteStruct(lens: StructLens, input: unknown): void {
     this.checkActive()
     this.checkAncestors(lens)
     const spec = this.activeSpec(lens)
-    deleteTree(this.snapshot, lens.path)
-    writeNode(this.snapshot, lens.path, spec, input, 'replace', lens.scopedFields, lens.schema)
+    deleteTree(this.state, lens.path)
+    writeNode(this.state, lens.path, spec, input, 'replace', lens.scopedFields, lens.schema)
   }
   delete(lens: AnyReadableLens | UntypedCustomFieldLens): void {
     this.checkActive()
@@ -382,7 +374,7 @@ export class Transaction extends ReadView {
           'Only optional nodes and Map entries are deletable',
         )
     }
-    deleteTree(this.snapshot, lens.path)
+    deleteTree(this.state, lens.path)
   }
   asTransaction(): SchemaTransaction {
     // The public interface supplies the precise generic overloads; implementation validates unknown inputs.

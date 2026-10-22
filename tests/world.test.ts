@@ -47,6 +47,207 @@ function leaf(view: TreeNodeView): Value {
   return view.entry.value
 }
 
+describe('lightweight world node reads', () => {
+  test('direct listings distinguish empty roots, missing paths and leaves in UTF-8 order', () => {
+    const { world } = setup()
+    const empty = commit(world, null, [])
+    expect(unwrap(world.listChildren(empty.id))).toEqual(some([]))
+    expect(unwrap(world.getNodeInfo(empty.id))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: empty.id }),
+    )
+
+    const populated = commit(world, empty, [
+      { op: 'set', path: ['data', '\u{10000}'], value: 1 },
+      { op: 'set', path: ['data', '\uE000'], value: 2 },
+      { op: 'set', path: ['data', 'nested', 'deep', 'value'], value: 3 },
+      { op: 'set', path: ['data', '__proto__'], value: 4 },
+      { op: 'set', path: ['data', 'a'], value: 5 },
+    ])
+    const listing = unwrap(world.listChildren(populated.id, ['data']))
+    expect(listing).toEqual(some(['__proto__', 'a', 'nested', '\uE000', '\u{10000}']))
+    expect(unwrap(world.listChildren(populated.id))).toEqual(some(['data']))
+    expect(unwrap(world.listChildren(populated.id, ['data', 'nested']))).toEqual(some(['deep']))
+    expect(unwrap(world.listChildren(populated.id, ['absent']))).toEqual(NONE)
+    expect(unwrap(world.getNodeInfo(populated.id, ['absent']))).toEqual(NONE)
+    expect(unwrap(world.getNodeInfo(populated.id, ['data', 'a']))).toEqual(
+      some({ nodeKind: 'leaf', originCommitId: populated.id }),
+    )
+    expect(world.listChildren(populated.id, ['data', 'a'])).toMatchObject({
+      ok: false,
+      error: { kind: 'structure_conflict', path: ['data', 'a'] },
+    })
+    // Descent through a leaf follows getNode's existing missing-path behavior.
+    expect(unwrap(world.listChildren(populated.id, ['data', 'a', 'child']))).toEqual(NONE)
+    expect(unwrap(world.getNodeInfo(populated.id, ['data', 'a', 'child']))).toEqual(NONE)
+    if (listing.kind !== 'some') throw new Error('Expected directory listing')
+    expect(Reflect.set(listing.value, '0', 'changed')).toBe(false)
+    expect(unwrap(world.listChildren(populated.id, ['data']))).toEqual(
+      some(['__proto__', 'a', 'nested', '\uE000', '\u{10000}']),
+    )
+  })
+
+  test('subtree revisions survive unrelated commits, equal-value rewrites and reloads', () => {
+    const { world, driver } = setup()
+    const initial = commit(world, null, [
+      { op: 'set', path: ['$schemas', 'version'], value: 'v1' },
+      { op: 'set', path: ['actors', 'alice', 'hp'], value: 1 },
+      { op: 'set', path: ['actors', 'bob', 'hp'], value: 2 },
+    ])
+    const messageOnly = commit(world, initial, [], 'no state changes')
+    expect(unwrap(world.getNodeInfo(messageOnly.id))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: initial.id }),
+    )
+    const changed = commit(world, messageOnly, [
+      { op: 'set', path: ['actors', 'alice', 'hp'], value: 3 },
+    ])
+    expect(unwrap(world.getNodeInfo(changed.id, ['actors']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: changed.id }),
+    )
+    expect(unwrap(world.getNodeInfo(changed.id, ['actors', 'bob']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: initial.id }),
+    )
+    expect(unwrap(world.getNodeInfo(changed.id, ['$schemas']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: initial.id }),
+    )
+    expect(unwrap(world.getNodeInfo(changed.id, ['actors', 'alice', 'hp']))).toEqual(
+      some({ nodeKind: 'leaf', originCommitId: changed.id }),
+    )
+    const equalWrite = commit(world, changed, [
+      { op: 'set', path: ['actors', 'alice', 'hp'], value: 3 },
+    ])
+    expect(unwrap(world.getNodeInfo(equalWrite.id, ['actors', 'alice']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: equalWrite.id }),
+    )
+    expect(unwrap(world.getNodeInfo(equalWrite.id, ['actors', 'alice', 'hp']))).toEqual(
+      some({ nodeKind: 'leaf', originCommitId: equalWrite.id }),
+    )
+    const schemaChange = commit(world, equalWrite, [
+      { op: 'set', path: ['$schemas', 'version'], value: 'v2' },
+    ])
+    const info = unwrap(world.getNodeInfo(schemaChange.id, ['$schemas']))
+    expect(info).toEqual(some({ nodeKind: 'dir', lastModifiedAt: schemaChange.id }))
+    if (info.kind !== 'some') throw new Error('Expected schema directory metadata')
+    expect(Reflect.set(info.value, 'lastModifiedAt', initial.id)).toBe(false)
+
+    const loaded = new WorldService(new Context(), { driver })
+    expect(unwrap(loaded.getNodeInfo(schemaChange.id, ['$schemas']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: schemaChange.id }),
+    )
+    expect(unwrap(loaded.getNodeInfo(schemaChange.id, ['actors', 'alice']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: equalWrite.id }),
+    )
+    expect(unwrap(loaded.getNodeInfo(initial.id, ['actors', 'alice', 'hp']))).toEqual(
+      some({ nodeKind: 'leaf', originCommitId: initial.id }),
+    )
+  })
+
+  test('metadata follows directory/leaf replacement and pruned-directory absence', () => {
+    const { world } = setup()
+    const directory = commit(world, null, [{ op: 'set', path: ['shape', 'child'], value: 1 }])
+    const replaced = commit(world, directory, [
+      { op: 'del', path: ['shape', 'child'] },
+      { op: 'set', path: ['shape'], value: 2 },
+    ])
+    expect(unwrap(world.getNodeInfo(directory.id, ['shape']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: directory.id }),
+    )
+    expect(unwrap(world.getNodeInfo(replaced.id, ['shape']))).toEqual(
+      some({ nodeKind: 'leaf', originCommitId: replaced.id }),
+    )
+    expect(world.listChildren(replaced.id, ['shape'])).toMatchObject({
+      ok: false,
+      error: { kind: 'structure_conflict' },
+    })
+    const restored = commit(world, replaced, [
+      { op: 'del', path: ['shape'] },
+      { op: 'set', path: ['shape', 'new'], value: 3 },
+    ])
+    expect(unwrap(world.listChildren(restored.id, ['shape']))).toEqual(some(['new']))
+    expect(unwrap(world.getNodeInfo(restored.id, ['shape']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: restored.id }),
+    )
+    const removed = commit(world, restored, [{ op: 'del', path: ['shape', 'new'] }])
+    expect(unwrap(world.listChildren(removed.id, ['shape']))).toEqual(NONE)
+    expect(unwrap(world.getNodeInfo(removed.id, ['shape']))).toEqual(NONE)
+    expect(unwrap(world.listChildren(removed.id))).toEqual(some([]))
+  })
+
+  test('invalid coordinates return structured failures without treating missing commits as empty trees', () => {
+    const { world } = setup()
+    const root = commit(world, null, [])
+    for (const read of [world.getNodeInfo.bind(world), world.listChildren.bind(world)]) {
+      expect(read('missing' as CommitHash, [])).toMatchObject({
+        ok: false,
+        error: { kind: 'commit_not_found', commitId: 'missing' },
+      })
+      expect(read(root.id, [''])).toMatchObject({
+        ok: false,
+        error: { kind: 'invalid_path', path: [''] },
+      })
+      expect(read(root.id, ['\uD800'])).toMatchObject({
+        ok: false,
+        error: { kind: 'invalid_path' },
+      })
+    }
+  })
+
+  test('cold metadata and child listings need no SQLite access or reference dereferencing', () => {
+    const { world, driver } = setup()
+    const target = commit(world, null, [
+      { op: 'set', path: ['payload', 'bytes'], value: new Uint8Array([1, 2, 3]) },
+      { op: 'set', path: ['payload', 'nested', 'deep'], value: true },
+    ])
+    const source = commit(world, target, [
+      { op: 'ref', path: ['link'], ref: { commitId: target.id, path: ['payload'] } },
+    ])
+    let allowIo = true
+    function checkIo(): void {
+      if (!allowIo) throw new Error('SQLite access is disabled')
+    }
+    const guardedDriver: SqliteDriver = {
+      exec(sql) {
+        checkIo()
+        driver.exec(sql)
+      },
+      prepare(sql) {
+        checkIo()
+        return driver.prepare(sql)
+      },
+      transaction(fn) {
+        checkIo()
+        return driver.transaction(fn)
+      },
+      close() {
+        driver.close()
+      },
+    }
+    const loaded = new WorldService(new Context(), { driver: guardedDriver })
+    allowIo = false
+    expect(unwrap(loaded.listChildren(source.id))).toEqual(some(['link', 'payload']))
+    expect(unwrap(loaded.listChildren(source.id, ['payload']))).toEqual(some(['bytes', 'nested']))
+    expect(unwrap(loaded.getNodeInfo(source.id, ['payload']))).toEqual(
+      some({ nodeKind: 'dir', lastModifiedAt: target.id }),
+    )
+    expect(unwrap(loaded.getNodeInfo(source.id, ['payload', 'bytes']))).toEqual(
+      some({ nodeKind: 'leaf', originCommitId: target.id }),
+    )
+    expect(unwrap(loaded.getNodeInfo(source.id, ['link']))).toEqual(
+      some({ nodeKind: 'leaf', originCommitId: source.id }),
+    )
+    expect(loaded.listChildren(source.id, ['link'])).toMatchObject({
+      ok: false,
+      error: { kind: 'structure_conflict', path: ['link'] },
+    })
+    // A payload read really is cold, proving the listings above did not hydrate it.
+    expect(loaded.getValue(source.id, ['payload', 'bytes'])).toMatchObject({
+      ok: false,
+      error: { kind: 'storage_error' },
+    })
+    allowIo = true
+    expect(value(loaded, source.id, ['payload', 'bytes'])).toEqual(new Uint8Array([1, 2, 3]))
+  })
+})
+
 describe('world forest', () => {
   test('canonical hashes, CAS before deduplication, and byte boundaries', () => {
     const { world } = setup()

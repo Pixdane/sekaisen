@@ -99,6 +99,27 @@ export type TreeNodeView =
   | { readonly nodeKind: 'leaf'; readonly entry: LeafEntry }
   | { readonly nodeKind: 'dir'; readonly entries: ReadonlyMap<string, TreeNodeView> }
 
+/**
+ * Detached node metadata from the in-memory origin index. Contains no leaf
+ * payloads or child maps and does not require loading values from storage.
+ * Leaf metadata intentionally does not distinguish value and reference entries.
+ */
+export type TreeNodeInfo =
+  | {
+      readonly nodeKind: 'leaf'
+      /** Commit whose diff last wrote this leaf, including equal-value rewrites. */
+      readonly originCommitId: CommitHash
+    }
+  | {
+      readonly nodeKind: 'dir'
+      /**
+       * Revision of this directory's structure or descendant leaves. Unchanged
+       * subtrees retain their revision across later commits. This is not a
+       * content hash: rewriting an equal value can produce a new revision.
+       */
+      readonly lastModifiedAt: CommitHash
+    }
+
 /** Conflict descriptor reported when a rebase precheck detects divergence. */
 export interface PathConflictDetail {
   readonly path: Path

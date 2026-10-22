@@ -1,5 +1,5 @@
 import type { Option, Result } from '@sekaisen/core'
-import { err, InvariantError, NONE, ok, some } from '@sekaisen/core'
+import { compareUtf8, err, InvariantError, NONE, ok, some } from '@sekaisen/core'
 import type { Context } from 'cordis'
 import { Service } from 'cordis'
 import {
@@ -28,6 +28,7 @@ import type {
   RebaseOptions,
   RebaseOutcome,
   StateRef,
+  TreeNodeInfo,
   TreeNodeView,
   Value,
   WorldConfig,
@@ -388,7 +389,62 @@ export class WorldService extends Service<WorldConfig> {
     return NONE
   }
 
-  /** Read the path-tree view (`leaf` or `dir`) at `path` (defaults to root `[]`) in commit `id`. */
+  /**
+   * Read frozen, detached node metadata from the origin index without SQLite
+   * access, leaf-value copying or descendant traversal. The path defaults to
+   * the root; an absent path returns `ok(NONE)`, while an empty root is a directory.
+   * Leaf info exposes its origin commit, not its value/reference kind or payload.
+   *
+   * Directory `lastModifiedAt` is a subtree revision, not a content hash. It
+   * remains stable when only unrelated subtrees change, but an equal-value
+   * rewrite inside the directory can advance it.
+   * @returns `commit_not_found` or `invalid_path` for invalid coordinates.
+   * @see TreeNodeInfo
+   */
+  getNodeInfo(id: CommitHash, path: Path = []): Result<Option<TreeNodeInfo>, WorldError> {
+    return this.attempt(() => {
+      this.checkPath(path)
+      const node = locate(this.requireCommit(id).index, path)
+      if (!node) return NONE
+      return some(
+        Object.freeze(
+          node.kind === 'leaf'
+            ? { nodeKind: 'leaf' as const, originCommitId: node.originCommitId }
+            : { nodeKind: 'dir' as const, lastModifiedAt: node.lastModifiedAt },
+        ),
+      )
+    })
+  }
+
+  /**
+   * Enumerate only a directory's direct child names in UTF-8 byte order.
+   * Returns a frozen, detached array; it never exposes the internal child Map,
+   * reads SQLite, copies leaf values or materializes descendant views.
+   *
+   * An absent path returns `ok(NONE)`; an empty directory returns `ok(some([]))`.
+   * An exact leaf path (including a reference) returns `structure_conflict`,
+   * not an empty listing. The path defaults to the root.
+   * @remarks For path depth d and k direct children, work is O(d + k log k)
+   * excluding string-byte costs; allocating the returned names array costs O(k).
+   * @returns `commit_not_found` or `invalid_path` for invalid coordinates.
+   */
+  listChildren(id: CommitHash, path: Path = []): Result<Option<readonly string[]>, WorldError> {
+    return this.attempt(() => {
+      this.checkPath(path)
+      const node = locate(this.requireCommit(id).index, path)
+      if (!node) return NONE
+      if (node.kind !== 'dir')
+        fail({ kind: 'structure_conflict', path, reason: 'Cannot list children of a leaf' })
+      return some(Object.freeze([...node.children.keys()].sort(compareUtf8)))
+    })
+  }
+
+  /**
+   * Materialize the complete subtree at `path` (defaults to root `[]`) as a
+   * detached leaf/directory view. This visits descendants, copies leaf values
+   * and may hydrate them from SQLite. For index-only reads without descendant
+   * materialization, use `getNodeInfo` or `listChildren` instead.
+   */
   getNode(id: CommitHash, path: Path = []): Result<Option<TreeNodeView>, WorldError> {
     return this.attempt(() => {
       this.checkPath(path)

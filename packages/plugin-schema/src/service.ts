@@ -16,7 +16,7 @@ import { assertIdentifier, cloneSchema, SchemaFailure } from './builders.ts'
 import { checkDrift, migrateSnapshot } from './evolution.ts'
 import { decodeMessage, encodeMessage, makeMessagePrism } from './message.ts'
 import { getLensRoot, getLensRoute, makeLens } from './optics.ts'
-import type { Catalog, Snapshot } from './runtime.ts'
+import type { Catalog } from './runtime.ts'
 import {
   cloneCatalog,
   cloneSnapshot,
@@ -27,6 +27,7 @@ import {
   inspectAt,
   materializeDefaultNode,
   readCatalog,
+  Snapshot,
   schemaAt,
   validateSnapshot,
   writeCatalog,
@@ -60,6 +61,7 @@ import type {
   SyncSchemaOptions,
   TypedCommitMessage,
 } from './types.ts'
+import { WorldStateReader, worldResult } from './world-reader.ts'
 
 declare module 'cordis' {
   interface Context {
@@ -76,10 +78,6 @@ interface ServiceState {
   messages: Map<symbol, { kind: string; schema: MessageStructSchemaNode }>
   validators: Set<CommitValidatorFn>
   busy: boolean
-}
-function worldResult<T>(result: Result<T, import('@sekaisen/plugin-world').WorldError>): T {
-  if (!result.ok) throw new SchemaFailure({ kind: 'world_error', error: result.error })
-  return result.value
 }
 function schemaPath(lens: StructLens): Path {
   return [
@@ -362,9 +360,10 @@ export class SchemaService extends Service {
       }
     })
   }
+  /** Only write/migration paths materialize a full snapshot; logical reads use StateReader. */
   private snapshot(commitId: CommitHash): Snapshot {
     const node = worldResult(this.ctx.world.getNode(commitId))
-    const snapshot: Snapshot = new Map()
+    const snapshot = new Snapshot()
     function flatten(view: TreeNodeView, path: Path): void {
       if (view.nodeKind === 'leaf') snapshot.set(encodePathKey(path), view.entry)
       else for (const [key, child] of view.entries) flatten(child, [...path, key])
@@ -373,17 +372,18 @@ export class SchemaService extends Service {
     return snapshot
   }
   /**
-   * Capture a commit snapshot and current Reader catalog for repeated logical
-   * reads. Reader defaults may be virtual; this does not migrate persisted data.
-   * Later Reader registration changes do not alter the returned view's catalog.
+   * Capture a fixed World commit and current Reader catalog for repeated logical
+   * reads. Payloads are fetched lazily from World, not copied into a full snapshot.
+   * Reader defaults may be virtual; later registrations do not alter this view.
+   * The backing World commit and storage must remain available for later reads.
    * @see ReadonlySchemaView
    */
   viewAt(commitId: CommitHash): Result<ReadonlySchemaView, SchemaError> {
     return attempt(() => {
-      const snapshot = this.snapshot(commitId)
+      const source = new WorldStateReader(this.ctx.world, commitId)
       return new ReadView(
-        snapshot,
-        readCatalog(snapshot, commitId),
+        source,
+        readCatalog(source, commitId),
         this.catalog(),
         commitId,
       ).readonlyView()
@@ -393,6 +393,7 @@ export class SchemaService extends Service {
    * Read a lens through the current Reader schema. Optional ancestor/member
    * absence returns `ok(NONE)`; invalid commits, incompatible kinds, missing
    * required nodes and detected Writer corruption return structured errors.
+   * Reads load the Writer catalog and requested subtree, not the entire world.
    * @see ReadonlySchemaView.get
    */
   get<L extends AnyReadableLens>(
@@ -412,7 +413,10 @@ export class SchemaService extends Service {
   ): Result<Option<FieldValueWithMeta<LeafValueTypeMap[L['valueKind']]>>, SchemaError> {
     return attempt(() => unwrap(unwrap(this.viewAt(commitId)).getWithMeta(lens)))
   }
-  /** List concrete Map member IDs in path order; a logically absent Map yields `[]`. */
+  /**
+   * List concrete Map member IDs in path order; a logically absent Map yields `[]`.
+   * As with a Map read, member values are still read and validated before listing.
+   */
   listKeys(commitId: CommitHash, lens: MapLens): Result<readonly string[], SchemaError> {
     return attempt(() => unwrap(unwrap(this.viewAt(commitId)).listKeys(lens)))
   }
@@ -426,8 +430,8 @@ export class SchemaService extends Service {
     path: Path,
   ): Result<Option<HistoricalNodeInspection>, SchemaError> {
     return attempt(() => {
-      const snapshot = this.snapshot(commitId)
-      return inspectAt(snapshot, readCatalog(snapshot, commitId), this.catalog(), commitId, path)
+      const source = new WorldStateReader(this.ctx.world, commitId)
+      return inspectAt(source, readCatalog(source, commitId), this.catalog(), commitId, path)
     })
   }
   /**
@@ -435,6 +439,7 @@ export class SchemaService extends Service {
    * message data with the commit's Writer catalog. Active registration is not
    * required for historical decoding; malformed encodings return
    * `message_decode_error`.
+   * Only the message and Writer catalog are loaded, not unrelated state payloads.
    */
   getMessage(commitId: CommitHash): Result<TypedCommitMessage, SchemaError> {
     return attempt(() => {
@@ -446,7 +451,7 @@ export class SchemaService extends Service {
           commitId,
           reason: 'Expected encoded message bytes or a plain string',
         })
-      const writer = readCatalog(this.snapshot(commitId), commitId)
+      const writer = readCatalog(new WorldStateReader(this.ctx.world, commitId), commitId)
       try {
         return decodeMessage(message, (kind) => writer.messages.get(kind))
       } catch (cause) {
@@ -552,7 +557,7 @@ export class SchemaService extends Service {
     return this.write(() => {
       const parentId = this.parent(options)
       const commitId = parentId.kind === 'some' ? parentId.value : ('' as CommitHash)
-      const before = parentId.kind === 'some' ? this.snapshot(parentId.value) : new Map()
+      const before = parentId.kind === 'some' ? this.snapshot(parentId.value) : new Snapshot()
       const reader = this.catalog()
       const writer =
         parentId.kind === 'some' ? readCatalog(before, parentId.value) : cloneCatalog(reader)
@@ -610,8 +615,8 @@ export class SchemaService extends Service {
    */
   checkDrift(commitId: CommitHash): Result<SchemaDriftReport, SchemaError> {
     return attempt(() => {
-      const snapshot = this.snapshot(commitId)
-      return checkDrift(snapshot, readCatalog(snapshot, commitId), this.catalog(), commitId)
+      const source = new WorldStateReader(this.ctx.world, commitId)
+      return checkDrift(source, readCatalog(source, commitId), this.catalog(), commitId)
     })
   }
   /**

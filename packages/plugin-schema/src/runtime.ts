@@ -27,7 +27,39 @@ import type {
   SchemaNode,
 } from './types.ts'
 
-export type Snapshot = Map<string, LeafEntry>
+/**
+ * Read-only access to the physical state tree. Implementations may be a fully
+ * materialized {@link Snapshot} or a lazy view over committed World nodes.
+ */
+export interface StateReader {
+  /** Return the exact physical leaf, or `undefined` for absent paths and directories. */
+  getEntry(path: Path): LeafEntry | undefined
+  /** Whether `path` is physically a leaf, without copying its payload. */
+  hasEntry(path: Path): boolean
+  /** Direct child keys in World UTF-8 order; absent paths and leaves yield `[]`. */
+  childKeys(path: Path): readonly string[]
+}
+/**
+ * Fully materialized schema state for transactions, migration and commits.
+ * Read-only code should depend on {@link StateReader} instead.
+ */
+export class Snapshot extends Map<string, LeafEntry> implements StateReader {
+  getEntry(path: Path): LeafEntry | undefined {
+    return this.get(encodePathKey(path))
+  }
+  hasEntry(path: Path): boolean {
+    return this.has(encodePathKey(path))
+  }
+  childKeys(path: Path): readonly string[] {
+    const prefix = encodePathKey(path)
+    const result = new Set<string>()
+    for (const key of this.keys()) {
+      if (key.startsWith(prefix) && key !== prefix)
+        result.add(decodePathKey(key.slice(prefix.length))[0]!)
+    }
+    return [...result].sort((a, b) => comparePaths([a], [b]))
+  }
+}
 export interface Catalog {
   roots: Map<string, { path: Path; schema: SchemaNode }>
   messages: Map<string, MessageStructSchemaNode>
@@ -49,17 +81,18 @@ export function copyValue<T extends Value | StateRef>(value: T): T {
   return (isStateRef(value) ? cloneStateRef(value) : cloneSchemaValue(value as Value)) as T
 }
 export function cloneSnapshot(source: Snapshot): Snapshot {
-  return new Map(
-    [...source].map(([key, entry]) => [
+  const copy = new Snapshot()
+  for (const [key, entry] of source)
+    copy.set(
       key,
       entry.entryKind === 'val'
         ? { entryKind: 'val', value: copyValue(entry.value) }
         : { entryKind: 'ref', ref: copyValue(entry.ref) },
-    ]),
-  )
+    )
+  return copy
 }
-export function getEntry(snapshot: Snapshot, path: Path): LeafEntry | undefined {
-  return snapshot.get(encodePathKey(path))
+export function getEntry(state: StateReader, path: Path): LeafEntry | undefined {
+  return state.getEntry(path)
 }
 export function setValue(
   snapshot: Snapshot,
@@ -78,22 +111,16 @@ export function deleteTree(snapshot: Snapshot, path: Path): void {
   const prefix = encodePathKey(path)
   for (const key of snapshot.keys()) if (key.startsWith(prefix)) snapshot.delete(key)
 }
-export function childKeys(snapshot: Snapshot, path: Path): string[] {
-  const prefix = encodePathKey(path)
-  const result = new Set<string>()
-  for (const key of snapshot.keys()) {
-    if (key.startsWith(prefix) && key !== prefix)
-      result.add(decodePathKey(key.slice(prefix.length))[0]!)
-  }
-  return [...result].sort((a, b) => comparePaths([a], [b]))
+export function childKeys(state: StateReader, path: Path): readonly string[] {
+  return state.childKeys(path)
 }
-export function hasNode(snapshot: Snapshot, path: Path, spec: SchemaNode): boolean {
-  return getEntry(snapshot, [...path, spec.nodeKind === 'leaf' ? '$val' : '$exists']) !== undefined
+export function hasNode(state: StateReader, path: Path, spec: SchemaNode): boolean {
+  return state.hasEntry([...path, spec.nodeKind === 'leaf' ? '$val' : '$exists'])
 }
-export function readMeta(snapshot: Snapshot, path: Path): SchemaMetaMap {
+export function readMeta(state: StateReader, path: Path): SchemaMetaMap {
   const meta: Record<string, Value> = Object.create(null)
-  for (const key of childKeys(snapshot, [...path, '$meta'])) {
-    const entry = getEntry(snapshot, [...path, '$meta', key])
+  for (const key of childKeys(state, [...path, '$meta'])) {
+    const entry = getEntry(state, [...path, '$meta', key])
     if (entry?.entryKind !== 'val')
       failValidation(path, 'type_mismatch', 'Metadata must contain value leaves')
     meta[key] = copyValue(entry.value)
@@ -107,8 +134,8 @@ export function validateValue(
 ): asserts value is Value | StateRef {
   assertLeafValue(spec.valueKind, value, path)
 }
-function val(snapshot: Snapshot, path: Path, commitId: CommitHash): Value {
-  const entry = getEntry(snapshot, path)
+function val(state: StateReader, path: Path, commitId: CommitHash): Value {
+  const entry = getEntry(state, path)
   if (entry?.entryKind !== 'val') corrupt(commitId, path, 'Missing schema value')
   return copyValue(entry.value)
 }
@@ -133,17 +160,17 @@ function writeSpec(snapshot: Snapshot, path: Path, node: SchemaNode): void {
       writeSpec(snapshot, [...path, 'fields', key], field)
   } else writeSpec(snapshot, [...path, 'valueSchema'], node.valueSchema)
 }
-function readSpec(snapshot: Snapshot, path: Path, commitId: CommitHash): SchemaNode {
-  const nodeKind = val(snapshot, [...path, 'nodeKind'], commitId)
-  const mode = val(snapshot, [...path, 'presenceMode'], commitId)
-  const description = val(snapshot, [...path, 'description'], commitId)
+function readSpec(state: StateReader, path: Path, commitId: CommitHash): SchemaNode {
+  const nodeKind = val(state, [...path, 'nodeKind'], commitId)
+  const mode = val(state, [...path, 'presenceMode'], commitId)
+  const description = val(state, [...path, 'description'], commitId)
   const metadata: Record<string, Value> = Object.create(null)
-  for (const key of childKeys(snapshot, [...path, 'metadata']))
-    metadata[key] = val(snapshot, [...path, 'metadata', key], commitId)
+  for (const key of childKeys(state, [...path, 'metadata']))
+    metadata[key] = val(state, [...path, 'metadata', key], commitId)
   let node: unknown
   if (nodeKind === 'leaf') {
-    const valueKind = val(snapshot, [...path, 'valueKind'], commitId)
-    const entry = getEntry(snapshot, [...path, 'defaultValue'])
+    const valueKind = val(state, [...path, 'valueKind'], commitId)
+    const entry = getEntry(state, [...path, 'defaultValue'])
     if (mode === 'defaulted' && !entry) corrupt(commitId, path, 'Missing schema default')
     node = {
       nodeKind,
@@ -157,12 +184,12 @@ function readSpec(snapshot: Snapshot, path: Path, commitId: CommitHash): SchemaN
     }
   } else if (nodeKind === 'struct') {
     const fields: Record<string, SchemaNode> = Object.create(null)
-    for (const key of childKeys(snapshot, [...path, 'fields']))
-      fields[key] = readSpec(snapshot, [...path, 'fields', key], commitId)
+    for (const key of childKeys(state, [...path, 'fields']))
+      fields[key] = readSpec(state, [...path, 'fields', key], commitId)
     node = {
       nodeKind,
       fields,
-      allowCustom: val(snapshot, [...path, 'allowCustom'], commitId),
+      allowCustom: val(state, [...path, 'allowCustom'], commitId),
       presence: { mode },
       description,
       metadata,
@@ -170,7 +197,7 @@ function readSpec(snapshot: Snapshot, path: Path, commitId: CommitHash): SchemaN
   } else if (nodeKind === 'map') {
     node = {
       nodeKind,
-      valueSchema: readSpec(snapshot, [...path, 'valueSchema'], commitId),
+      valueSchema: readSpec(state, [...path, 'valueSchema'], commitId),
       presence: { mode },
       description,
       metadata,
@@ -188,11 +215,11 @@ export function writeCustomSpec(snapshot: Snapshot, path: Path, spec: LeafSchema
   writeSpec(snapshot, [...path, '$spec'], spec)
 }
 export function readCustomSpec(
-  snapshot: Snapshot,
+  state: StateReader,
   path: Path,
   commitId: CommitHash,
 ): LeafSchemaNode {
-  const spec = readSpec(snapshot, [...path, '$spec'], commitId)
+  const spec = readSpec(state, [...path, '$spec'], commitId)
   if (spec.nodeKind !== 'leaf') corrupt(commitId, path, 'Custom spec is not a leaf')
   return spec
 }
@@ -204,11 +231,11 @@ export function writeCatalog(snapshot: Snapshot, catalog: Catalog): void {
   for (const [kind, spec] of catalog.messages)
     writeSpec(snapshot, ['$schemas', 'messages', kind], spec)
 }
-export function readCatalog(snapshot: Snapshot, commitId: CommitHash): Catalog {
+export function readCatalog(state: StateReader, commitId: CommitHash): Catalog {
   const catalog = emptyCatalog()
-  if (val(snapshot, ['$schemas', '$version'], commitId) !== 1)
+  if (val(state, ['$schemas', '$version'], commitId) !== 1)
     corrupt(commitId, ['$schemas'], 'Unsupported schema version')
-  for (const key of childKeys(snapshot, ['$schemas', 'roots'])) {
+  for (const key of childKeys(state, ['$schemas', 'roots'])) {
     let path: Path
     try {
       path = decodePathKey(key)
@@ -224,12 +251,12 @@ export function readCatalog(snapshot: Snapshot, commitId: CommitHash): Catalog {
     }
     catalog.roots.set(key, {
       path,
-      schema: readSpec(snapshot, ['$schemas', 'roots', key], commitId),
+      schema: readSpec(state, ['$schemas', 'roots', key], commitId),
     })
   }
-  for (const kind of childKeys(snapshot, ['$schemas', 'messages'])) {
+  for (const kind of childKeys(state, ['$schemas', 'messages'])) {
     assertIdentifier(kind)
-    const spec = readSpec(snapshot, ['$schemas', 'messages', kind], commitId)
+    const spec = readSpec(state, ['$schemas', 'messages', kind], commitId)
     function validMessage(node: SchemaNode): boolean {
       return node.nodeKind === 'leaf'
         ? node.valueKind !== 'ref'
@@ -339,7 +366,7 @@ export function typeCompatible(a: SchemaNode, b: SchemaNode): boolean {
   )
 }
 export function resolvePresence(
-  snapshot: Snapshot,
+  state: StateReader,
   path: Path,
   reader: SchemaNode,
   writer: SchemaNode | undefined,
@@ -347,7 +374,7 @@ export function resolvePresence(
   virtual = false,
   entry = false,
 ): 'physical' | 'virtual' | 'absent' {
-  const physical = !virtual && hasNode(snapshot, path, reader)
+  const physical = !virtual && hasNode(state, path, reader)
   if (physical) {
     if (writer && !typeCompatible(reader, writer))
       throw new SchemaFailure({
@@ -358,14 +385,14 @@ export function resolvePresence(
         actualKind: writer.nodeKind === 'leaf' ? writer.valueKind : writer.nodeKind,
       })
     if (reader.nodeKind !== 'leaf') {
-      const anchor = getEntry(snapshot, [...path, '$exists'])!
+      const anchor = getEntry(state, [...path, '$exists'])!
       if (anchor.entryKind !== 'val' || anchor.value !== true)
         corrupt(commitId, path, 'Container anchor must equal true')
     }
     return 'physical'
   }
   // A kind change can leave a different physical discriminator at this path.
-  if (!virtual && writer && hasNode(snapshot, path, writer) && !typeCompatible(reader, writer)) {
+  if (!virtual && writer && hasNode(state, path, writer) && !typeCompatible(reader, writer)) {
     throw new SchemaFailure({
       kind: 'schema_type_mismatch',
       commitId,
@@ -382,7 +409,7 @@ export function resolvePresence(
   throw new SchemaFailure({ kind: 'unmigrated_required_field', commitId, path })
 }
 export function readNode(
-  snapshot: Snapshot,
+  state: StateReader,
   path: Path,
   reader: SchemaNode,
   writer: SchemaNode | undefined,
@@ -390,15 +417,15 @@ export function readNode(
   virtual = false,
   entry = false,
 ): Option<unknown> {
-  const state = resolvePresence(snapshot, path, reader, writer, commitId, virtual, entry)
-  if (state === 'absent') return NONE
-  const isVirtual = state === 'virtual'
+  const presence = resolvePresence(state, path, reader, writer, commitId, virtual, entry)
+  if (presence === 'absent') return NONE
+  const isVirtual = presence === 'virtual'
   if (reader.nodeKind === 'leaf') {
     const value =
       isVirtual && reader.presence.mode === 'defaulted'
         ? reader.presence.defaultValue
         : (() => {
-            const raw = getEntry(snapshot, [...path, '$val'])!
+            const raw = getEntry(state, [...path, '$val'])!
             if ((reader.valueKind === 'ref') !== (raw.entryKind === 'ref'))
               corrupt(commitId, path, 'Wrong leaf entry kind')
             return raw.entryKind === 'val' ? raw.value : raw.ref
@@ -414,10 +441,10 @@ export function readNode(
   const result: Record<string, unknown> = Object.create(null)
   if (reader.nodeKind === 'map') {
     if (!isVirtual)
-      for (const key of childKeys(snapshot, path).filter((k) => k !== '$exists')) {
+      for (const key of childKeys(state, path).filter((k) => k !== '$exists')) {
         assertIdentifier(key)
         const child = readNode(
-          snapshot,
+          state,
           [...path, key],
           reader.valueSchema,
           writer?.nodeKind === 'map' ? writer.valueSchema : undefined,
@@ -432,7 +459,7 @@ export function readNode(
   } else {
     for (const [key, field] of Object.entries(reader.fields)) {
       const child = readNode(
-        snapshot,
+        state,
         [...path, key],
         field,
         writer?.nodeKind === 'struct' ? writer.fields[key] : undefined,
@@ -445,14 +472,14 @@ export function readNode(
     if (reader.allowCustom) {
       const custom: Record<string, unknown> = Object.create(null)
       if (!isVirtual)
-        for (const key of childKeys(snapshot, [...path, '$custom'])) {
+        for (const key of childKeys(state, [...path, '$custom'])) {
           assertIdentifier(key)
           if (Object.hasOwn(reader.fields, key)) continue // Pending promotion is inspected faithfully through Writer Schema.
           const at = [...path, '$custom', key]
-          const spec = readCustomSpec(snapshot, at, commitId)
-          const value = readNode(snapshot, at, spec, spec, commitId)
+          const spec = readCustomSpec(state, at, commitId)
+          const value = readNode(state, at, spec, spec, commitId)
           if (value.kind === 'none') corrupt(commitId, at, 'Custom value is absent')
-          custom[key] = Object.freeze({ value: value.value, meta: readMeta(snapshot, at), spec })
+          custom[key] = Object.freeze({ value: value.value, meta: readMeta(state, at), spec })
         }
       result.$custom = Object.freeze(custom)
     }
@@ -591,21 +618,21 @@ export function writeNode(
   }
 }
 export function inspectNode(
-  snapshot: Snapshot,
+  state: StateReader,
   path: Path,
   writer: SchemaNode,
   reader: SchemaNode | undefined,
   commitId: CommitHash,
 ): Option<HistoricalNodeInspection> {
-  const presence = resolvePresence(snapshot, path, writer, writer, commitId)
+  const presence = resolvePresence(state, path, writer, writer, commitId)
   if (presence === 'absent') {
-    if (getEntry(snapshot, path) || childKeys(snapshot, path).length)
+    if (getEntry(state, path) || childKeys(state, path).length)
       corrupt(commitId, path, 'Absent node contains orphan data')
     return NONE
   }
-  if (getEntry(snapshot, path)) corrupt(commitId, path, 'Logical nodes must be directories')
+  if (getEntry(state, path)) corrupt(commitId, path, 'Logical nodes must be directories')
   if (writer.nodeKind !== 'map') {
-    for (const key of childKeys(snapshot, path)) {
+    for (const key of childKeys(state, path)) {
       const allowed =
         writer.nodeKind === 'leaf'
           ? key === '$val' || key === '$meta' || (key === '$spec' && path.at(-2) === '$custom')
@@ -614,7 +641,7 @@ export function inspectNode(
     }
   }
   if (writer.nodeKind === 'leaf') {
-    const value = readNode(snapshot, path, writer, writer, commitId)
+    const value = readNode(state, path, writer, writer, commitId)
     if (value.kind === 'none') return NONE
     return some(
       Object.freeze({
@@ -622,16 +649,16 @@ export function inspectNode(
         path: Object.freeze([...path]),
         writerSpec: cloneSchema(writer) as LeafSchemaNode,
         value: value.value as Value | StateRef,
-        meta: readMeta(snapshot, path),
+        meta: readMeta(state, path),
       }),
     )
   }
   if (writer.nodeKind === 'map') {
     const entries: Record<string, HistoricalNodeInspection> = Object.create(null)
-    for (const key of childKeys(snapshot, path).filter((k) => k !== '$exists')) {
+    for (const key of childKeys(state, path).filter((k) => k !== '$exists')) {
       assertIdentifier(key)
       const child = inspectNode(
-        snapshot,
+        state,
         [...path, key],
         writer.valueSchema,
         reader?.nodeKind === 'map' ? reader.valueSchema : undefined,
@@ -656,23 +683,23 @@ export function inspectNode(
   > = Object.create(null)
   for (const [key, child] of Object.entries(writer.fields))
     fields[key] = inspectNode(
-      snapshot,
+      state,
       [...path, key],
       child,
       reader?.nodeKind === 'struct' ? reader.fields[key] : undefined,
       commitId,
     )
-  for (const key of childKeys(snapshot, [...path, '$custom'])) {
+  for (const key of childKeys(state, [...path, '$custom'])) {
     assertIdentifier(key)
     if (!writer.allowCustom || Object.hasOwn(writer.fields, key))
       corrupt(commitId, path, 'Invalid or shadowing custom field')
     const at = [...path, '$custom', key],
-      spec = readCustomSpec(snapshot, at, commitId)
-    const value = readNode(snapshot, at, spec, spec, commitId)
+      spec = readCustomSpec(state, at, commitId)
+    const value = readNode(state, at, spec, spec, commitId)
     if (value.kind === 'none') corrupt(commitId, at, 'Custom value missing')
     customFields[key] = Object.freeze({
       value: value.value as Value | StateRef,
-      meta: readMeta(snapshot, at),
+      meta: readMeta(state, at),
       spec,
     })
   }
@@ -692,7 +719,7 @@ export function inspectNode(
   )
 }
 export function inspectAt(
-  snapshot: Snapshot,
+  state: StateReader,
   writer: Catalog,
   reader: Catalog,
   commitId: CommitHash,
@@ -704,18 +731,18 @@ export function inspectAt(
     let at = [...root.path]
     // Validate ancestors before navigating, so absent optional/map members short-circuit.
     for (const key of path.slice(root.path.length)) {
-      if (resolvePresence(snapshot, at, spec, spec, commitId) === 'absent') return NONE
+      if (resolvePresence(state, at, spec, spec, commitId) === 'absent') return NONE
       if (spec.nodeKind === 'struct') {
         const child: SchemaNode | undefined = spec.fields[key]
         if (!child) return NONE
         spec = child
       } else if (spec.nodeKind === 'map') {
         spec = spec.valueSchema
-        if (!hasNode(snapshot, [...at, key], spec)) return NONE
+        if (!hasNode(state, [...at, key], spec)) return NONE
       } else return NONE
       at = [...at, key]
     }
-    return inspectNode(snapshot, path, spec, physicalSchemaAt(reader, path), commitId)
+    return inspectNode(state, path, spec, physicalSchemaAt(reader, path), commitId)
   }
   return NONE
 }

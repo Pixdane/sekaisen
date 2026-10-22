@@ -784,10 +784,12 @@ export interface SchemaCommitOptions {
 }
 
 /**
- * Read-only logical access using a Writer snapshot and a captured Reader catalog.
- * Reads may synthesize Reader defaults without persisting them; missing optional
- * ancestors and Map members short-circuit to absence. Stale kinds, unmigrated
- * required nodes and detected Writer corruption return structured errors.
+ * Read-only logical access using Writer definitions and a captured Reader catalog.
+ * Historical views read requested payloads lazily from a fixed World commit;
+ * transaction views observe their current draft. Reads may synthesize defaults
+ * without persisting them. Missing optional ancestors and Map members short-circuit
+ * to absence; incompatible kinds, unmigrated required nodes and detected Writer
+ * corruption return structured errors.
  */
 export interface ReadonlySchemaView {
   /**
@@ -806,7 +808,11 @@ export interface ReadonlySchemaView {
     lens: UntypedCustomFieldLens,
   ): Result<Option<FieldValueWithMeta<Value | StateRef>>, SchemaError>
 
-  /** List concrete Map member IDs in path order; an absent Map yields an empty array. */
+  /**
+   * List concrete Map member IDs in path order; an absent Map yields an empty array.
+   * Member values are read and validated, just as for a Map get; this is not a
+   * shallow physical directory listing that bypasses malformed-member errors.
+   */
   listKeys(mapLens: MapLens): Result<readonly string[], SchemaError>
 }
 
@@ -1051,7 +1057,12 @@ export interface SchemaServiceApi {
    */
   addCommitValidator(validator: CommitValidatorFn): () => void
 
-  /** Capture a commit and the current Reader catalog as a reusable read-only logical view. */
+  /**
+   * Capture a fixed World commit and the current Reader catalog as a reusable
+   * logical view. Loads only the Writer catalog up front; values are read lazily.
+   * Later Reader registrations do not change this view. The backing World commit
+   * and storage must remain available for subsequent reads.
+   */
   viewAt(commitId: CommitHash): Result<ReadonlySchemaView, SchemaError>
 
   /** Read through the current Reader schema; `NONE` means logical absence, not an invalid commit. */
@@ -1066,7 +1077,7 @@ export interface SchemaServiceApi {
     fieldLens: FieldLens<TLeaf> | CustomFieldLens<TLeaf>,
   ): Result<Option<FieldValueWithMeta<LeafValueTypeMap[TLeaf['valueKind']]>>, SchemaError>
 
-  /** List Map member IDs in path order through the current Reader schema; absent Maps yield `[]`. */
+  /** List logical Map member IDs after validating their values; absent Maps yield `[]`. */
   listKeys(commitId: CommitHash, mapLens: MapLens): Result<readonly string[], SchemaError>
 
   /**

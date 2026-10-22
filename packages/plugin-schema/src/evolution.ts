@@ -3,7 +3,7 @@ import { err, isOption, NONE, ok, some } from '@sekaisen/core'
 import type { CommitHash, Path, ScalarValue, StateRef, Value } from '@sekaisen/plugin-world'
 import { encodePathKey } from '@sekaisen/plugin-world'
 import { cloneSchema, SchemaFailure } from './builders.ts'
-import type { Catalog, Snapshot } from './runtime.ts'
+import type { Catalog, Snapshot, StateReader } from './runtime.ts'
 import {
   childKeys,
   cloneSnapshot,
@@ -228,7 +228,7 @@ class DriftSink {
  * an otherwise clean report dirty, all other active differences do.
  */
 export function checkDrift(
-  snapshot: Snapshot,
+  snapshot: StateReader,
   writer: Catalog,
   reader: Catalog,
   commitId: CommitHash,
@@ -378,7 +378,7 @@ export function migrateSnapshot(
 /* -------------------------------------------------------------------------- */
 
 function analyze(
-  snapshot: Snapshot,
+  snapshot: StateReader,
   writer: Catalog,
   reader: Catalog,
   commitId: CommitHash,
@@ -429,7 +429,7 @@ function analyze(
  * schema itself, so structural drift is reported even without stored data.
  */
 function compareNode(
-  snapshot: Snapshot,
+  snapshot: StateReader,
   writerSpec: SchemaNode | undefined,
   readerSpec: SchemaNode,
   schemaPath: Path,
@@ -548,7 +548,7 @@ function recordChangedTypeMissing(
 }
 
 function addNode(
-  snapshot: Snapshot,
+  snapshot: StateReader,
   readerSpec: SchemaNode,
   schemaPath: Path,
   missingPaths: readonly Path[],
@@ -564,7 +564,7 @@ function addNode(
       const formalPath: Path = [...parent, site.fieldKey]
       const formalExists = hasNode(snapshot, formalPath, readerSpec)
       const customPath: Path = [...parent, CUSTOM_SEGMENT, site.fieldKey]
-      const customExists = getEntry(snapshot, [...customPath, '$val']) !== undefined
+      const customExists = snapshot.hasEntry([...customPath, '$val'])
       if (!customExists) {
         if (!formalExists) missing.push(formalPath)
         continue
@@ -688,7 +688,7 @@ function retainsRequiredFields(writer: StructSchemaNode, reader: StructSchemaNod
 }
 
 function compareStruct(
-  snapshot: Snapshot,
+  snapshot: StateReader,
   writer: StructSchemaNode,
   reader: StructSchemaNode,
   schemaPath: Path,
@@ -728,7 +728,7 @@ function compareStruct(
 }
 
 function compareMap(
-  snapshot: Snapshot,
+  snapshot: StateReader,
   writer: MapSchemaNode,
   reader: MapSchemaNode,
   schemaPath: Path,
@@ -849,7 +849,7 @@ function migrationFailure(commitId: CommitHash, report: SchemaDriftReport, messa
 
 function applyPromotionValue(
   draft: Snapshot,
-  source: Snapshot,
+  source: StateReader,
   commitId: CommitHash,
   targetPath: Path,
   targetSpec: LeafSchemaNode,
@@ -954,7 +954,7 @@ function splitMigrationResult(value: MigrationInputValue): {
 }
 
 function inspectSource(
-  source: Snapshot,
+  source: StateReader,
   writer: Catalog,
   reader: Catalog,
   commitId: CommitHash,
@@ -966,7 +966,7 @@ function inspectSource(
 }
 
 function inspectSourceResult(
-  source: Snapshot,
+  source: StateReader,
   writer: Catalog,
   reader: Catalog,
   commitId: CommitHash,
@@ -981,7 +981,7 @@ function inspectSourceResult(
 }
 
 function inspectCustomLeaf(
-  source: Snapshot,
+  source: StateReader,
   instancePath: Path,
   key: string,
   commitId: CommitHash,
