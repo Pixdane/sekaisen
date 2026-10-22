@@ -8,6 +8,11 @@
     "./bun": "./src/bun.ts",
     "./node": "./src/node.ts"
   },
-  "engines": { "node": ">=22.13.0" },
-  "dependencies": { "@sekaisen/core": "workspace:*", "cordis": "4.0.0-rc.11" }
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@sekaisen/core": "workspace:*",
+    "cordis": "4.0.0-rc.11"
+  }
 }
