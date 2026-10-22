@@ -986,6 +986,8 @@ export interface SchemaTransaction extends ReadonlySchemaView {
 /**
  * Synchronous final-draft business rule, run after structural validation and
  * before world persistence by both `commit` and `syncSchema`.
+ * Every registered rule runs on incremental commits and empty no-op diffs too;
+ * structural validation records never cache business-rule acceptance.
  * Validators run in registration order from a registration snapshot; the
  * first `err({ path, validatorName, reason })` aborts with `validator_rejected`.
  * No commit/head update is performed by that schema operation on rejection.
@@ -1107,15 +1109,19 @@ export interface SchemaServiceApi {
 
   /**
    * Apply one synchronous copy-on-write draft callback without copying the full
-   * World state. Validate all final Writer-covered data and run registered
-   * business rules before atomically persisting the net diff through world.
+   * World state. Validate the final Writer-covered state and run every registered
+   * business rule before atomically persisting the net diff through world.
    * Active schema drift requires prior sync; dormant-only drift is retained.
    * Returning `Err<SchemaError>` or throwing a schema failure rejects the draft.
    * Validator rejection or world CAS failure creates no commit for this call;
    * callback side effects are not rolled back. Ordinary exceptions, async
    * callbacks and reentrant schema writes throw rather than returning `Err`.
    * Exact physical restoration, including metadata, emits no diff operations;
-   * final structural validation still covers unchanged Writer data.
+   * a retained validated parent with unchanged Reader registrations enables
+   * incremental structural checks and drift preflight reuse. Other parents and
+   * changed registrations receive final full validation after the callback.
+   * Definitions registered inside callbacks/validators do not certify the output
+   * for the newer Reader snapshot; all business rules still run on every call.
    * @see SchemaCommitOptions for parent selection and head expectations.
    */
   commit(
@@ -1123,7 +1129,11 @@ export interface SchemaServiceApi {
     mutate?: (tx: SchemaTransaction) => void | Result<void, SchemaError>,
   ): Result<CommitNode, SchemaError>
 
-  /** Compare the stored Writer catalog with active Reader definitions without modifying state. */
+  /**
+   * Compare the stored Writer catalog with active Reader definitions without
+   * modifying state. Always computes the full report and instance counts;
+   * validated-commit records do not suppress this explicit query.
+   */
   checkDrift(commitId: CommitHash): Result<SchemaDriftReport, SchemaError>
 
   /**

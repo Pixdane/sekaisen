@@ -613,18 +613,26 @@ export function writeNode(
     }
   }
 }
-export function inspectNode(
+
+/**
+ * Validate the structural header of one logical Writer node: physical presence,
+ * container anchor, logical-directory shape, and (outside Maps) the set of
+ * direct child names. Returns `false` for an absent optional node that leaves
+ * no orphan data; every invalid shape throws the same failure as full
+ * inspection. Callers that need values, metadata, children, or custom fields
+ * must continue with {@link inspectNode} or the incremental routing rules.
+ */
+export function validateNodeHeader(
   state: StateReader,
   path: Path,
   writer: SchemaNode,
-  reader: SchemaNode | undefined,
   commitId: CommitHash,
-): Option<HistoricalNodeInspection> {
+): boolean {
   const presence = resolvePresence(state, path, writer, writer, commitId)
   if (presence === 'absent') {
     if (getEntry(state, path) || childKeys(state, path).length)
       corrupt(commitId, path, 'Absent node contains orphan data')
-    return NONE
+    return false
   }
   if (getEntry(state, path)) corrupt(commitId, path, 'Logical nodes must be directories')
   if (writer.nodeKind !== 'map') {
@@ -636,6 +644,17 @@ export function inspectNode(
       if (!allowed) corrupt(commitId, [...path, key], 'Field is not declared in Writer Schema')
     }
   }
+  return true
+}
+
+export function inspectNode(
+  state: StateReader,
+  path: Path,
+  writer: SchemaNode,
+  reader: SchemaNode | undefined,
+  commitId: CommitHash,
+): Option<HistoricalNodeInspection> {
+  if (!validateNodeHeader(state, path, writer, commitId)) return NONE
   if (writer.nodeKind === 'leaf') {
     const value = readNode(state, path, writer, writer, commitId)
     if (value.kind === 'none') return NONE

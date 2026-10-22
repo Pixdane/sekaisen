@@ -59,6 +59,7 @@ import type {
   SyncSchemaOptions,
   TypedCommitMessage,
 } from './types.ts'
+import { validateChangedState } from './validation.ts'
 import { WorldStateReader, worldResult } from './world-reader.ts'
 
 declare module 'cordis' {
@@ -67,6 +68,7 @@ declare module 'cordis' {
   }
 }
 const WRITER_CATALOG_LIMIT = 64
+const VALIDATED_COMMIT_LIMIT = 256
 const SCHEMA_PATH: Path = Object.freeze(['$schemas'])
 
 interface Augmentation {
@@ -79,6 +81,10 @@ interface ServiceState {
   messages: Map<symbol, { kind: string; schema: MessageStructSchemaNode }>
   validators: Set<CommitValidatorFn>
   writerCatalogs: Map<CommitHash, Catalog>
+  /** Bounded LRU certificates for Writer data under captured Reader revisions. */
+  validatedCommits: Map<CommitHash, symbol>
+  /** Changes on Reader registration/disposal, never on validator registration. */
+  readerRevision: symbol
   busy: boolean
 }
 function schemaPath(lens: StructLens): Path {
@@ -122,8 +128,11 @@ function replaceSchema(
  *
  * Successfully parsed Writer catalogs are reused in a bounded cache keyed by
  * the `$schemas` subtree revision, independently of active Reader registrations.
- * Cache hits still require the requested World commit to exist. Structural
- * validation and business validators are never skipped because of a cache hit.
+ * Cache hits still require the requested World commit to exist and never
+ * certify physical data by themselves. A separate bounded record of successful
+ * schema commits enables incremental checks only for an unchanged Reader
+ * registration snapshot; unknown parents and `syncSchema` receive full checks.
+ * Registered business validators always run, including on empty diffs.
  *
  * Structural and business-rule checks protect schema commit/sync operations,
  * not direct world writes, rebases or head changes. Expected schema failures
@@ -146,6 +155,8 @@ export class SchemaService extends Service {
       messages: new Map(),
       validators: new Set(),
       writerCatalogs: new Map(),
+      validatedCommits: new Map(),
+      readerRevision: Symbol(),
       busy: false,
     }
   }
@@ -235,8 +246,9 @@ export class SchemaService extends Service {
           this.state.roots.delete(id)
           throw cause
         }
+        this.state.readerRevision = Symbol()
         return () => {
-          this.state.roots.delete(id)
+          if (this.state.roots.delete(id)) this.state.readerRevision = Symbol()
         }
       })
       return makeLens<S>(ownedPath, cloneSchema(schema) as SchemaNodeOf<S>)
@@ -293,8 +305,9 @@ export class SchemaService extends Service {
       const id = Symbol()
       this.ctx.effect(() => {
         this.state.augmentations.set(id, { path, fields })
+        this.state.readerRevision = Symbol()
         return () => {
-          this.state.augmentations.delete(id)
+          if (this.state.augmentations.delete(id)) this.state.readerRevision = Symbol()
         }
       })
       const schema = cloneSchema({
@@ -332,8 +345,9 @@ export class SchemaService extends Service {
       const id = Symbol()
       this.ctx.effect(() => {
         this.state.messages.set(id, { kind, schema })
+        this.state.readerRevision = Symbol()
         return () => {
-          this.state.messages.delete(id)
+          if (this.state.messages.delete(id)) this.state.readerRevision = Symbol()
         }
       })
       return prism
@@ -512,17 +526,32 @@ export class SchemaService extends Service {
       )
     return NONE
   }
+  /**
+   * Validate one final draft, run business rules and atomically publish it.
+   * Positive records are installed only after World success, using the Reader
+   * snapshot captured before callbacks/converters, validators and observers.
+   */
   private finish(
     draft: DraftOverlay,
     catalog: Catalog,
     reader: Catalog,
     parentId: Option<CommitHash>,
     message: Value,
+    readerRevision: symbol,
+    mode: 'full' | 'incremental',
     head?: string | AdvanceHeadInput,
   ): CommitNode {
     const commitId = parentId.kind === 'some' ? parentId.value : ('' as CommitHash)
-    validateState(draft, catalog, commitId)
-    const diff: StateDiff = draft.compileDiff()
+    let diff: StateDiff
+    if (mode === 'incremental') {
+      diff = draft.compileDiff()
+      validateChangedState(draft, catalog, commitId, diff)
+    } else {
+      // Unknown parents are checked after mutation, so callbacks may repair
+      // malformed values. Keep their validation-before-diff error ordering.
+      validateState(draft, catalog, commitId)
+      diff = draft.compileDiff()
+    }
     const view = new ReadView(draft, catalog, reader, commitId).readonlyView()
     for (const validator of [...this.state.validators]) {
       const exposedDiff: StateDiff = Object.freeze(
@@ -539,7 +568,7 @@ export class SchemaService extends Service {
       const result = validator({ parentId, draft: view, diff: exposedDiff })
       if (!result.ok) throw new SchemaFailure({ kind: 'validator_rejected', ...result.error })
     }
-    return worldResult(
+    const node = worldResult(
       this.ctx.world.commit({
         parentId,
         message,
@@ -554,11 +583,22 @@ export class SchemaService extends Service {
             }),
       }),
     )
+    // Capture the operation's Reader revision, not registrations changed by
+    // callbacks, validators or World observers while this operation was active.
+    const validated = this.state.validatedCommits
+    if (mode === 'incremental' && parentId.kind === 'some') {
+      validated.delete(parentId.value)
+      validated.set(parentId.value, readerRevision)
+    }
+    validated.delete(node.id)
+    if (validated.size >= VALIDATED_COMMIT_LIMIT) validated.delete(validated.keys().next().value!)
+    validated.set(node.id, readerRevision)
+    return node
   }
   /**
-   * Mutate a lazy copy-on-write draft synchronously, fully check all final
-   * Writer-covered data, run registered validators and persist the net diff
-   * through world with atomic head/CAS. No full World snapshot is copied.
+   * Mutate a lazy copy-on-write draft synchronously, validate its final
+   * Writer-covered state, run every registered validator and persist the net
+   * diff through world with atomic head/CAS. No full World snapshot is copied.
    * Active Reader/Writer drift requires `syncSchema`; dormant-only differences
    * are retained. The transaction's mutation methods close when `mutate` exits.
    *
@@ -568,7 +608,12 @@ export class SchemaService extends Service {
    * @remarks Rejection creates no commit/head update for this operation, but cannot
    * undo callback side effects or direct world writes. Expected schema failures
    * thrown by mutators become `Err`; other exceptions propagate.
-   * Final structural validation is still full, not restricted to changed paths.
+   * A retained, validated parent under the same Reader registration snapshot
+   * reuses its drift preflight and validates changed branches plus ancestor
+   * structure; unchanged Writer data is trusted. Unknown/unretained parents or
+   * changed Reader registrations receive final full validation after `mutate`.
+   * Reader definitions changed inside callbacks, validators or observers cannot
+   * certify the output for that newer registration snapshot.
    * Restoring physical values and metadata exactly produces no diff operations.
    * Draft/read-only views require the backing World storage to remain available.
    * @throws TypeError if the callback returns a Promise/thenable.
@@ -588,9 +633,13 @@ export class SchemaService extends Service {
           ? new WorldStateReader(this.ctx.world, parentId.value)
           : EMPTY_STATE
       const reader = this.catalog()
+      const readerRevision = this.state.readerRevision
       const writer =
         parentId.kind === 'some' ? this.writerCatalog(parentId.value, before) : cloneCatalog(reader)
-      if (parentId.kind === 'some') {
+      const incremental =
+        parentId.kind === 'some' &&
+        this.state.validatedCommits.get(parentId.value) === readerRevision
+      if (parentId.kind === 'some' && !incremental) {
         const drift = checkDrift(before, writer, reader, parentId.value)
         if (
           drift.backfillableNodes.length ||
@@ -634,12 +683,23 @@ export class SchemaService extends Service {
           })
         message = encodeMessage(options.message, schema)
       }
-      return this.finish(draft, catalog, reader, parentId, message, options.head)
+      return this.finish(
+        draft,
+        catalog,
+        reader,
+        parentId,
+        message,
+        readerRevision,
+        incremental ? 'incremental' : 'full',
+        options.head,
+      )
     })
   }
   /**
    * Compare the commit's stored Writer catalog with active Reader definitions
    * without writing data. Dormant definitions alone leave `isClean` true.
+   * Always computes the report, including concrete instance counts; validated
+   * commit records only elide the internal unchanged-Reader commit preflight.
    * @see SchemaDriftReport
    */
   checkDrift(commitId: CommitHash): Result<SchemaDriftReport, SchemaError> {
@@ -655,6 +715,7 @@ export class SchemaService extends Service {
    * source, never another converter's output. All final Writer-covered data and
    * registered validators must pass before world atomically persists the net
    * `syncSchema` diff and advances the head with CAS.
+   * This always performs final full validation, regardless of parent records.
    *
    * @param options Head/expectation, dormant policy (default `keep`) and per-schema converters.
    * @returns The sync commit, or a structured drift/migration/validator/world failure.
@@ -677,6 +738,7 @@ export class SchemaService extends Service {
       const before = new WorldStateReader(this.ctx.world, parentId.value)
       const writer = this.writerCatalog(parentId.value, before),
         reader = this.catalog()
+      const readerRevision = this.state.readerRevision
       const migrated = migrateState(before, writer, reader, parentId.value, options)
       return this.finish(
         migrated.draft,
@@ -684,6 +746,8 @@ export class SchemaService extends Service {
         reader,
         parentId,
         'syncSchema',
+        readerRevision,
+        'full',
         options.head,
       )
     })
