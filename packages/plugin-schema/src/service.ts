@@ -16,7 +16,7 @@ import { checkDrift, migrateState } from './evolution.ts'
 import { decodeMessage, encodeMessage, makeMessagePrism } from './message.ts'
 import { getLensRoot, getLensRoute, makeLens } from './optics.ts'
 import { DraftOverlay } from './overlay.ts'
-import type { Catalog } from './runtime.ts'
+import type { Catalog, MutableCatalog, StateReader } from './runtime.ts'
 import {
   cloneCatalog,
   copyValue,
@@ -66,6 +66,9 @@ declare module 'cordis' {
     schema: SchemaService
   }
 }
+const WRITER_CATALOG_LIMIT = 64
+const SCHEMA_PATH: Path = Object.freeze(['$schemas'])
+
 interface Augmentation {
   path: Path
   fields: Readonly<Record<string, SchemaNode>>
@@ -75,6 +78,7 @@ interface ServiceState {
   augmentations: Map<symbol, Augmentation>
   messages: Map<symbol, { kind: string; schema: MessageStructSchemaNode }>
   validators: Set<CommitValidatorFn>
+  writerCatalogs: Map<CommitHash, Catalog>
   busy: boolean
 }
 function schemaPath(lens: StructLens): Path {
@@ -84,7 +88,7 @@ function schemaPath(lens: StructLens): Path {
   ]
 }
 function replaceSchema(
-  catalog: Catalog,
+  catalog: MutableCatalog,
   path: Path,
   transform: (node: SchemaNode) => SchemaNode,
 ): void {
@@ -116,6 +120,11 @@ function replaceSchema(
  * `ctx.world`. Definitions, message kinds and validators follow the calling
  * Cordis scope's lifetime; historical Writer catalogs remain in commits.
  *
+ * Successfully parsed Writer catalogs are reused in a bounded cache keyed by
+ * the `$schemas` subtree revision, independently of active Reader registrations.
+ * Cache hits still require the requested World commit to exist. Structural
+ * validation and business validators are never skipped because of a cache hit.
+ *
  * Structural and business-rule checks protect schema commit/sync operations,
  * not direct world writes, rebases or head changes. Expected schema failures
  * return `Err`; unrelated callback exceptions and reentrant writes throw.
@@ -136,6 +145,7 @@ export class SchemaService extends Service {
       augmentations: new Map(),
       messages: new Map(),
       validators: new Set(),
+      writerCatalogs: new Map(),
       busy: false,
     }
   }
@@ -165,6 +175,32 @@ export class SchemaService extends Service {
       })
     }
     for (const { kind, schema } of this.state.messages.values()) catalog.messages.set(kind, schema)
+    return catalog
+  }
+  /**
+   * Reuse a parsed Writer catalog only while its `$schemas` directory revision
+   * matches. Check the requested commit first, even on hits, so deleted commits
+   * never become readable through the cache. Missing/leaf catalogs and parse
+   * failures are not cached; errors retain the requested commit's identity.
+   *
+   * Keep at most 64 successfully parsed revisions in insertion order. Cached
+   * catalogs are read-only inputs: Reader registrations remain freshly scoped,
+   * and migration/merge code builds separate mutable maps.
+   */
+  private writerCatalog(commitId: CommitHash, source?: StateReader): Catalog {
+    const info = worldResult(this.ctx.world.getNodeInfo(commitId, SCHEMA_PATH))
+    const revision =
+      info.kind === 'some' && info.value.nodeKind === 'dir' ? info.value.lastModifiedAt : undefined
+    const cache = this.state.writerCatalogs
+    if (revision !== undefined) {
+      const cached = cache.get(revision)
+      if (cached !== undefined) return cached
+    }
+    const catalog = readCatalog(source ?? new WorldStateReader(this.ctx.world, commitId), commitId)
+    if (revision !== undefined) {
+      if (cache.size >= WRITER_CATALOG_LIMIT) cache.delete(cache.keys().next().value!)
+      cache.set(revision, catalog)
+    }
     return catalog
   }
   /**
@@ -370,7 +406,7 @@ export class SchemaService extends Service {
       const source = new WorldStateReader(this.ctx.world, commitId)
       return new ReadView(
         source,
-        readCatalog(source, commitId),
+        this.writerCatalog(commitId, source),
         this.catalog(),
         commitId,
       ).readonlyView()
@@ -418,7 +454,7 @@ export class SchemaService extends Service {
   ): Result<Option<HistoricalNodeInspection>, SchemaError> {
     return attempt(() => {
       const source = new WorldStateReader(this.ctx.world, commitId)
-      return inspectAt(source, readCatalog(source, commitId), this.catalog(), commitId, path)
+      return inspectAt(source, this.writerCatalog(commitId, source), this.catalog(), commitId, path)
     })
   }
   /**
@@ -438,7 +474,7 @@ export class SchemaService extends Service {
           commitId,
           reason: 'Expected encoded message bytes or a plain string',
         })
-      const writer = readCatalog(new WorldStateReader(this.ctx.world, commitId), commitId)
+      const writer = this.writerCatalog(commitId)
       try {
         return decodeMessage(message, (kind) => writer.messages.get(kind))
       } catch (cause) {
@@ -553,7 +589,7 @@ export class SchemaService extends Service {
           : EMPTY_STATE
       const reader = this.catalog()
       const writer =
-        parentId.kind === 'some' ? readCatalog(before, parentId.value) : cloneCatalog(reader)
+        parentId.kind === 'some' ? this.writerCatalog(parentId.value, before) : cloneCatalog(reader)
       if (parentId.kind === 'some') {
         const drift = checkDrift(before, writer, reader, parentId.value)
         if (
@@ -609,7 +645,7 @@ export class SchemaService extends Service {
   checkDrift(commitId: CommitHash): Result<SchemaDriftReport, SchemaError> {
     return attempt(() => {
       const source = new WorldStateReader(this.ctx.world, commitId)
-      return checkDrift(source, readCatalog(source, commitId), this.catalog(), commitId)
+      return checkDrift(source, this.writerCatalog(commitId, source), this.catalog(), commitId)
     })
   }
   /**
@@ -639,7 +675,7 @@ export class SchemaService extends Service {
           error: { kind: 'head_not_found', headName: name },
         })
       const before = new WorldStateReader(this.ctx.world, parentId.value)
-      const writer = readCatalog(before, parentId.value),
+      const writer = this.writerCatalog(parentId.value, before),
         reader = this.catalog()
       const migrated = migrateState(before, writer, reader, parentId.value, options)
       return this.finish(

@@ -1061,7 +1061,9 @@ export interface SchemaServiceApi {
 
   /**
    * Capture a fixed World commit and the current Reader catalog as a reusable
-   * logical view. Loads only the Writer catalog up front; values are read lazily.
+   * logical view. Obtains the Writer catalog from a bounded subtree-revision
+   * cache, parsing on a miss; state values remain lazy. Reader definitions are
+   * captured independently of that cache.
    * Later Reader registrations do not change this view. The backing World commit
    * and storage must remain available for subsequent reads.
    */

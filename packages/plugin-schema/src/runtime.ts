@@ -58,11 +58,21 @@ export const EMPTY_STATE: StateReader = Object.freeze({
   hasEntry: () => false,
   childKeys: () => EMPTY_KEYS,
 })
-export interface Catalog {
-  roots: Map<string, { path: Path; schema: SchemaNode }>
-  messages: Map<string, MessageStructSchemaNode>
+interface CatalogRoot {
+  readonly path: Path
+  readonly schema: SchemaNode
 }
-export function emptyCatalog(): Catalog {
+/** Shared schema catalogs are read-only; mutations require a fresh builder. */
+export interface Catalog {
+  readonly roots: ReadonlyMap<string, CatalogRoot>
+  readonly messages: ReadonlyMap<string, MessageStructSchemaNode>
+}
+/** Owned catalog maps used only while building or merging definitions. */
+export interface MutableCatalog extends Catalog {
+  readonly roots: Map<string, CatalogRoot>
+  readonly messages: Map<string, MessageStructSchemaNode>
+}
+export function emptyCatalog(): MutableCatalog {
   return { roots: new Map(), messages: new Map() }
 }
 export function failValidation(
@@ -256,7 +266,7 @@ export function readCatalog(state: StateReader, commitId: CommitHash): Catalog {
   }
   return catalog
 }
-export function cloneCatalog(catalog: Catalog): Catalog {
+export function cloneCatalog(catalog: Catalog): MutableCatalog {
   return {
     roots: new Map(
       [...catalog.roots].map(([key, root]) => [
