@@ -4,6 +4,7 @@ export {
   decodePathKey,
   encodePathKey,
   leafEntryEquals,
+  validatePath,
   valueEquals,
 } from './codec.ts'
 export { WorldService, WorldService as default } from './service.ts'

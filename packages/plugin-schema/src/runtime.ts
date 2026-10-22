@@ -1,14 +1,7 @@
 import type { Option } from '@sekaisen/core'
 import { isOption, NONE, some } from '@sekaisen/core'
-import type {
-  CommitHash,
-  LeafEntry,
-  Path,
-  StateDiff,
-  StateRef,
-  Value,
-} from '@sekaisen/plugin-world'
-import { comparePaths, decodePathKey, encodePathKey, leafEntryEquals } from '@sekaisen/plugin-world'
+import type { CommitHash, LeafEntry, Path, StateRef, Value } from '@sekaisen/plugin-world'
+import { decodePathKey, encodePathKey } from '@sekaisen/plugin-world'
 import {
   assertIdentifier,
   assertLeafValue,
@@ -28,8 +21,9 @@ import type {
 } from './types.ts'
 
 /**
- * Read-only access to the physical state tree. Implementations may be a fully
- * materialized {@link Snapshot} or a lazy view over committed World nodes.
+ * Read-only access to a physical state tree, backed by a committed World or an
+ * isolated draft. Payload reads and direct child enumeration are independent.
+ * Path arguments are borrowed for the synchronous call and must not be retained.
  */
 export interface StateReader {
   /** Return the exact physical leaf, or `undefined` for absent paths and directories. */
@@ -40,26 +34,30 @@ export interface StateReader {
   childKeys(path: Path): readonly string[]
 }
 /**
- * Fully materialized schema state for transactions, migration and commits.
- * Read-only code should depend on {@link StateReader} instead.
+ * Mutable physical draft. Writes own their entry/path inputs and subtree deletes
+ * affect subsequent reads immediately, without changing the immutable base.
  */
-export class Snapshot extends Map<string, LeafEntry> implements StateReader {
-  getEntry(path: Path): LeafEntry | undefined {
-    return this.get(encodePathKey(path))
-  }
-  hasEntry(path: Path): boolean {
-    return this.has(encodePathKey(path))
-  }
-  childKeys(path: Path): readonly string[] {
-    const prefix = encodePathKey(path)
-    const result = new Set<string>()
-    for (const key of this.keys()) {
-      if (key.startsWith(prefix) && key !== prefix)
-        result.add(decodePathKey(key.slice(prefix.length))[0]!)
-    }
-    return [...result].sort((a, b) => comparePaths([a], [b]))
-  }
+export interface StateWriter extends StateReader {
+  /**
+   * Own and validate a leaf before changing the draft. Existing ancestors and
+   * descendants are not implicitly removed; replacing a subtree requires deletion.
+   */
+  setEntry(path: Path, entry: LeafEntry): void
+  /**
+   * Hide the exact leaf and every descendant, including earlier draft writes.
+   * `[]` clears the whole draft; later writes recreate only explicit coordinates.
+   */
+  deleteTree(path: Path): void
 }
+
+const EMPTY_KEYS: readonly string[] = Object.freeze([])
+
+/** Empty physical state used as the immutable base of a new root commit. */
+export const EMPTY_STATE: StateReader = Object.freeze({
+  getEntry: () => undefined,
+  hasEntry: () => false,
+  childKeys: () => EMPTY_KEYS,
+})
 export interface Catalog {
   roots: Map<string, { path: Path; schema: SchemaNode }>
   messages: Map<string, MessageStructSchemaNode>
@@ -80,36 +78,24 @@ export function corrupt(commitId: CommitHash, path: Path, reason: string): never
 export function copyValue<T extends Value | StateRef>(value: T): T {
   return (isStateRef(value) ? cloneStateRef(value) : cloneSchemaValue(value as Value)) as T
 }
-export function cloneSnapshot(source: Snapshot): Snapshot {
-  const copy = new Snapshot()
-  for (const [key, entry] of source)
-    copy.set(
-      key,
-      entry.entryKind === 'val'
-        ? { entryKind: 'val', value: copyValue(entry.value) }
-        : { entryKind: 'ref', ref: copyValue(entry.ref) },
-    )
-  return copy
-}
 export function getEntry(state: StateReader, path: Path): LeafEntry | undefined {
   return state.getEntry(path)
 }
 export function setValue(
-  snapshot: Snapshot,
+  snapshot: StateWriter,
   path: Path,
   value: Value | StateRef,
   ref = false,
 ): void {
-  snapshot.set(
-    encodePathKey(path),
+  snapshot.setEntry(
+    path,
     ref
-      ? Object.freeze({ entryKind: 'ref', ref: copyValue(value as StateRef) })
-      : Object.freeze({ entryKind: 'val', value: copyValue(value as Value) }),
+      ? { entryKind: 'ref', ref: value as StateRef }
+      : { entryKind: 'val', value: value as Value },
   )
 }
-export function deleteTree(snapshot: Snapshot, path: Path): void {
-  const prefix = encodePathKey(path)
-  for (const key of snapshot.keys()) if (key.startsWith(prefix)) snapshot.delete(key)
+export function deleteTree(snapshot: StateWriter, path: Path): void {
+  snapshot.deleteTree(path)
 }
 export function childKeys(state: StateReader, path: Path): readonly string[] {
   return state.childKeys(path)
@@ -139,7 +125,7 @@ function val(state: StateReader, path: Path, commitId: CommitHash): Value {
   if (entry?.entryKind !== 'val') corrupt(commitId, path, 'Missing schema value')
   return copyValue(entry.value)
 }
-function writeSpec(snapshot: Snapshot, path: Path, node: SchemaNode): void {
+function writeSpec(snapshot: StateWriter, path: Path, node: SchemaNode): void {
   setValue(snapshot, [...path, 'nodeKind'], node.nodeKind)
   setValue(snapshot, [...path, 'presenceMode'], node.presence.mode)
   setValue(snapshot, [...path, 'description'], node.description)
@@ -210,7 +196,7 @@ function readSpec(state: StateReader, path: Path, commitId: CommitHash): SchemaN
     throw cause
   }
 }
-export function writeCustomSpec(snapshot: Snapshot, path: Path, spec: LeafSchemaNode): void {
+export function writeCustomSpec(snapshot: StateWriter, path: Path, spec: LeafSchemaNode): void {
   deleteTree(snapshot, [...path, '$spec'])
   writeSpec(snapshot, [...path, '$spec'], spec)
 }
@@ -223,7 +209,7 @@ export function readCustomSpec(
   if (spec.nodeKind !== 'leaf') corrupt(commitId, path, 'Custom spec is not a leaf')
   return spec
 }
-export function writeCatalog(snapshot: Snapshot, catalog: Catalog): void {
+export function writeCatalog(snapshot: StateWriter, catalog: Catalog): void {
   deleteTree(snapshot, ['$schemas'])
   setValue(snapshot, ['$schemas', '$version'], 1)
   for (const [key, root] of catalog.roots)
@@ -502,7 +488,7 @@ function inputRecord(input: unknown, path: Path): Record<string, unknown> {
 export function unwrapOptional(input: unknown): unknown {
   return isOption(input) ? (input.kind === 'none' ? null : input.value) : input
 }
-export function materializeDefaultNode(snapshot: Snapshot, path: Path, spec: SchemaNode): void {
+export function materializeDefaultNode(snapshot: StateWriter, path: Path, spec: SchemaNode): void {
   if (spec.presence.mode !== 'defaulted') return
   if (spec.nodeKind === 'leaf' && spec.presence.mode === 'defaulted') {
     setValue(snapshot, [...path, '$val'], spec.presence.defaultValue, spec.valueKind === 'ref')
@@ -514,7 +500,7 @@ export function materializeDefaultNode(snapshot: Snapshot, path: Path, spec: Sch
   }
 }
 export function writeNode(
-  snapshot: Snapshot,
+  snapshot: StateWriter,
   path: Path,
   spec: SchemaNode,
   input: unknown,
@@ -746,40 +732,8 @@ export function inspectAt(
   }
   return NONE
 }
-export function validateSnapshot(snapshot: Snapshot, catalog: Catalog, commitId: CommitHash): void {
+/** Validate every Writer root in the final draft; no incremental trust shortcut is taken. */
+export function validateState(state: StateReader, catalog: Catalog, commitId: CommitHash): void {
   for (const root of catalog.roots.values())
-    inspectNode(snapshot, root.path, root.schema, root.schema, commitId)
-}
-/** Compare final leaves, coalescing complete subtree removals into directory deletes. */
-export function compileDiff(before: Snapshot, after: Snapshot): StateDiff {
-  const removed = new Set<string>()
-  for (const key of before.keys()) if (!after.has(key)) removed.add(key)
-  const deleted: Path[] = []
-  const keysAfter = [...after.keys()]
-  for (const key of removed) {
-    const path = decodePathKey(key)
-    let candidate = path
-    for (let len = 1; len < path.length; len++) {
-      const parent = path.slice(0, len),
-        prefix = encodePathKey(parent)
-      if (!keysAfter.some((k) => k.startsWith(prefix))) {
-        candidate = parent
-        break
-      }
-    }
-    if (!deleted.some((p) => encodePathKey(candidate).startsWith(encodePathKey(p))))
-      deleted.push(candidate)
-  }
-  const diff: Array<StateDiff[number]> = deleted.map((path) => ({ op: 'del', path }))
-  for (const [key, entry] of after) {
-    const previous = before.get(key)
-    if (previous && leafEntryEquals(previous, entry)) continue
-    const path = decodePathKey(key)
-    diff.push(
-      entry.entryKind === 'val'
-        ? { op: 'set', path, value: copyValue(entry.value) }
-        : { op: 'ref', path, ref: copyValue(entry.ref) },
-    )
-  }
-  return Object.freeze(diff.sort((a, b) => comparePaths(a.path, b.path)))
+    inspectNode(state, root.path, root.schema, root.schema, commitId)
 }

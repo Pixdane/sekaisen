@@ -40,8 +40,8 @@ export class WorldStateReader implements StateReader {
 
   childKeys(path: Path): readonly string[] {
     const info = worldResult(this.world.getNodeInfo(this.commitId, path))
-    // Flat Snapshot readers have no descendants under a leaf. Preserve that
-    // behavior instead of changing malformed-directory handling into a World error.
+    // StateReader treats leaves as having no direct children rather than
+    // surfacing World's directory-only structure_conflict for this coordinate.
     if (info.kind === 'none' || info.value.nodeKind === 'leaf') return EMPTY_KEYS
     const keys = worldResult(this.world.listChildren(this.commitId, path))
     return keys.kind === 'some' ? keys.value : EMPTY_KEYS

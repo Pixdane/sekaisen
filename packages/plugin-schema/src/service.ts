@@ -6,30 +6,28 @@ import type {
   CommitNode,
   Path,
   StateDiff,
-  TreeNodeView,
   Value,
 } from '@sekaisen/plugin-world'
 import { encodePathKey } from '@sekaisen/plugin-world'
 import type { Context } from 'cordis'
 import { Service } from 'cordis'
 import { assertIdentifier, cloneSchema, SchemaFailure } from './builders.ts'
-import { checkDrift, migrateSnapshot } from './evolution.ts'
+import { checkDrift, migrateState } from './evolution.ts'
 import { decodeMessage, encodeMessage, makeMessagePrism } from './message.ts'
 import { getLensRoot, getLensRoute, makeLens } from './optics.ts'
+import { DraftOverlay } from './overlay.ts'
 import type { Catalog } from './runtime.ts'
 import {
   cloneCatalog,
-  cloneSnapshot,
-  compileDiff,
   copyValue,
+  EMPTY_STATE,
   effectiveCatalog,
   emptyCatalog,
   inspectAt,
   materializeDefaultNode,
   readCatalog,
-  Snapshot,
   schemaAt,
-  validateSnapshot,
+  validateState,
   writeCatalog,
 } from './runtime.ts'
 import { attempt, ReadView, Transaction, unwrap } from './transaction.ts'
@@ -360,17 +358,6 @@ export class SchemaService extends Service {
       }
     })
   }
-  /** Only write/migration paths materialize a full snapshot; logical reads use StateReader. */
-  private snapshot(commitId: CommitHash): Snapshot {
-    const node = worldResult(this.ctx.world.getNode(commitId))
-    const snapshot = new Snapshot()
-    function flatten(view: TreeNodeView, path: Path): void {
-      if (view.nodeKind === 'leaf') snapshot.set(encodePathKey(path), view.entry)
-      else for (const [key, child] of view.entries) flatten(child, [...path, key])
-    }
-    if (node.kind === 'some') flatten(node.value, [])
-    return snapshot
-  }
   /**
    * Capture a fixed World commit and current Reader catalog for repeated logical
    * reads. Payloads are fetched lazily from World, not copied into a full snapshot.
@@ -490,8 +477,7 @@ export class SchemaService extends Service {
     return NONE
   }
   private finish(
-    before: Snapshot,
-    draft: Snapshot,
+    draft: DraftOverlay,
     catalog: Catalog,
     reader: Catalog,
     parentId: Option<CommitHash>,
@@ -499,8 +485,8 @@ export class SchemaService extends Service {
     head?: string | AdvanceHeadInput,
   ): CommitNode {
     const commitId = parentId.kind === 'some' ? parentId.value : ('' as CommitHash)
-    validateSnapshot(draft, catalog, commitId)
-    const diff: StateDiff = compileDiff(before, draft)
+    validateState(draft, catalog, commitId)
+    const diff: StateDiff = draft.compileDiff()
     const view = new ReadView(draft, catalog, reader, commitId).readonlyView()
     for (const validator of [...this.state.validators]) {
       const exposedDiff: StateDiff = Object.freeze(
@@ -534,8 +520,9 @@ export class SchemaService extends Service {
     )
   }
   /**
-   * Mutate an isolated draft synchronously, check its final physical schema,
-   * run registered validators and persist through world with atomic head/CAS.
+   * Mutate a lazy copy-on-write draft synchronously, fully check all final
+   * Writer-covered data, run registered validators and persist the net diff
+   * through world with atomic head/CAS. No full World snapshot is copied.
    * Active Reader/Writer drift requires `syncSchema`; dormant-only differences
    * are retained. The transaction's mutation methods close when `mutate` exits.
    *
@@ -545,6 +532,9 @@ export class SchemaService extends Service {
    * @remarks Rejection creates no commit/head update for this operation, but cannot
    * undo callback side effects or direct world writes. Expected schema failures
    * thrown by mutators become `Err`; other exceptions propagate.
+   * Final structural validation is still full, not restricted to changed paths.
+   * Restoring physical values and metadata exactly produces no diff operations.
+   * Draft/read-only views require the backing World storage to remain available.
    * @throws TypeError if the callback returns a Promise/thenable.
    * @throws InvariantError if called reentrantly during a schema write or validator.
    * @see SchemaCommitOptions
@@ -557,7 +547,10 @@ export class SchemaService extends Service {
     return this.write(() => {
       const parentId = this.parent(options)
       const commitId = parentId.kind === 'some' ? parentId.value : ('' as CommitHash)
-      const before = parentId.kind === 'some' ? this.snapshot(parentId.value) : new Snapshot()
+      const before =
+        parentId.kind === 'some'
+          ? new WorldStateReader(this.ctx.world, parentId.value)
+          : EMPTY_STATE
       const reader = this.catalog()
       const writer =
         parentId.kind === 'some' ? readCatalog(before, parentId.value) : cloneCatalog(reader)
@@ -577,7 +570,7 @@ export class SchemaService extends Service {
         }
       }
       const catalog = effectiveCatalog(reader, writer, true)
-      const draft = cloneSnapshot(before)
+      const draft = new DraftOverlay(before)
       if (parentId.kind === 'none') {
         writeCatalog(draft, reader)
         for (const root of reader.roots.values())
@@ -605,7 +598,7 @@ export class SchemaService extends Service {
           })
         message = encodeMessage(options.message, schema)
       }
-      return this.finish(before, draft, catalog, reader, parentId, message, options.head)
+      return this.finish(draft, catalog, reader, parentId, message, options.head)
     })
   }
   /**
@@ -622,9 +615,10 @@ export class SchemaService extends Service {
   /**
    * Synchronize the current tip of an existing head to the active Reader schema.
    * Backfills, promotions, supplied migrations and optional pruning build a
-   * separate draft; every converter reads the immutable pre-migration source.
-   * The final physical state and registered validators must pass before world
-   * atomically persists the `syncSchema` commit and advances the head with CAS.
+   * copy-on-write draft; every converter reads the immutable pre-migration
+   * source, never another converter's output. All final Writer-covered data and
+   * registered validators must pass before world atomically persists the net
+   * `syncSchema` diff and advances the head with CAS.
    *
    * @param options Head/expectation, dormant policy (default `keep`) and per-schema converters.
    * @returns The sync commit, or a structured drift/migration/validator/world failure.
@@ -644,14 +638,12 @@ export class SchemaService extends Service {
           kind: 'world_error',
           error: { kind: 'head_not_found', headName: name },
         })
-      const before = this.snapshot(parentId.value)
+      const before = new WorldStateReader(this.ctx.world, parentId.value)
       const writer = readCatalog(before, parentId.value),
         reader = this.catalog()
-      const migrated = migrateSnapshot(before, writer, reader, parentId.value, options)
-      writeCatalog(migrated.snapshot, migrated.catalog)
+      const migrated = migrateState(before, writer, reader, parentId.value, options)
       return this.finish(
-        before,
-        migrated.snapshot,
+        migrated.draft,
         migrated.catalog,
         reader,
         parentId,

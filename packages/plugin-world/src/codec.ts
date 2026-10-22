@@ -85,7 +85,15 @@ function isStrictPrefix(prefix: Path, path: Path): boolean {
 /*                                  Paths                                    */
 /* -------------------------------------------------------------------------- */
 
-/** Validate every segment: non-empty, string, well-formed Unicode. */
+/**
+ * Validate path shape without encoding, copying or changing the input.
+ * Every segment must be a non-empty, well-formed Unicode string.
+ *
+ * @param path Segment array; `[]` denotes the root.
+ * @param allowEmpty Whether the root is valid (default `true`).
+ * @throws CodecError with `invalid_path` for a non-array, invalid segment or
+ * a root path when `allowEmpty` is `false`.
+ */
 export function validatePath(path: Path, allowEmpty = true): void {
   if (!Array.isArray(path)) {
     failInvalidPath(EMPTY_PATH, 'path must be an array')

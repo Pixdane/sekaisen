@@ -4,7 +4,7 @@ import type { CommitHash, Path, StateRef, Value } from '@sekaisen/plugin-world'
 import { encodePathKey } from '@sekaisen/plugin-world'
 import { assertIdentifier, cloneSchema, cloneSchemaMetadata, SchemaFailure } from './builders.ts'
 import { getLensRoot, getLensRoute } from './optics.ts'
-import type { Catalog, Snapshot, StateReader } from './runtime.ts'
+import type { Catalog, StateReader, StateWriter } from './runtime.ts'
 import {
   deleteTree,
   failValidation,
@@ -217,7 +217,7 @@ export class ReadView<TState extends StateReader = StateReader> implements Reado
   }
 }
 
-export class Transaction extends ReadView<Snapshot> {
+export class Transaction extends ReadView<StateWriter> {
   private active = true
   finish(): void {
     this.active = false

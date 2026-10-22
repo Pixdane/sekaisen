@@ -834,6 +834,8 @@ export type DeletableLens =
 /**
  * Mutable draft supplied only to the synchronous `SchemaService.commit` callback.
  * Mutations affect subsequent reads in this draft, not the parent commit.
+ * The draft lazily overlays the immutable parent and owns written payloads.
+ * Reads require the backing World storage to remain available.
  * Required ancestors must already exist; mutation methods throw schema failures
  * rather than returning `Result`. Let failures escape to reject the draft;
  * operations are not individual savepoints if their failures are caught.
@@ -1102,13 +1104,16 @@ export interface SchemaServiceApi {
   ): Result<Option<InferCoreOutput<TSchema>>, SchemaError>
 
   /**
-   * Apply one synchronous draft callback, validate the final physical state and
-   * run registered business rules before atomically persisting through world.
+   * Apply one synchronous copy-on-write draft callback without copying the full
+   * World state. Validate all final Writer-covered data and run registered
+   * business rules before atomically persisting the net diff through world.
    * Active schema drift requires prior sync; dormant-only drift is retained.
    * Returning `Err<SchemaError>` or throwing a schema failure rejects the draft.
    * Validator rejection or world CAS failure creates no commit for this call;
    * callback side effects are not rolled back. Ordinary exceptions, async
    * callbacks and reentrant schema writes throw rather than returning `Err`.
+   * Exact physical restoration, including metadata, emits no diff operations;
+   * final structural validation still covers unchanged Writer data.
    * @see SchemaCommitOptions for parent selection and head expectations.
    */
   commit(
@@ -1121,10 +1126,11 @@ export interface SchemaServiceApi {
 
   /**
    * Migrate the current tip of an existing head to the active Reader schema,
-   * preserving dormant definitions unless explicitly pruned. Converters read
-   * an immutable source. The final draft passes structural and registered
-   * validator checks before world commit/CAS; failure leaves this operation's
-   * commit and head update unpersisted. The commit message is `syncSchema`.
+   * preserving dormant definitions unless explicitly pruned. Converters always
+   * read the immutable source, isolated from earlier draft writes. The lazy
+   * copy-on-write draft passes full structural and registered validator checks
+   * before world commit/CAS; failure leaves this operation's commit and head
+   * update unpersisted. Only the net diff is persisted; its message is `syncSchema`.
    */
   syncSchema(options: SyncSchemaOptions): Result<CommitNode, SchemaError>
 }

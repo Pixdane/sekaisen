@@ -3,10 +3,10 @@ import { err, isOption, NONE, ok, some } from '@sekaisen/core'
 import type { CommitHash, Path, ScalarValue, StateRef, Value } from '@sekaisen/plugin-world'
 import { encodePathKey } from '@sekaisen/plugin-world'
 import { cloneSchema, SchemaFailure } from './builders.ts'
-import type { Catalog, Snapshot, StateReader } from './runtime.ts'
+import { DraftOverlay } from './overlay.ts'
+import type { Catalog, StateReader, StateWriter } from './runtime.ts'
 import {
   childKeys,
-  cloneSnapshot,
   copyValue,
   corrupt,
   deleteTree,
@@ -18,7 +18,6 @@ import {
   physicalSchemaAt,
   readCustomSpec,
   readMeta,
-  validateSnapshot,
   writeCatalog,
   writeNode,
 } from './runtime.ts'
@@ -237,26 +236,26 @@ export function checkDrift(
 }
 
 /**
- * Apply every drift transition to an in-memory clone of `snapshot`, validate it
- * against the full target catalog (dormant definitions included when kept), and
- * return both the migrated snapshot and that catalog. Never writes storage.
+ * Apply drift transitions to an isolated Overlay and return its target catalog.
+ * The caller validates the complete final state before running validators and
+ * persisting through World; this function never writes storage.
  *
- * All reads used by migration functions are bound to the immutable pre-migration
- * `snapshot`, so the result is independent of migration execution order.
+ * Converter inspections always read the immutable pre-migration source, never
+ * earlier converter results or the mutable draft.
  */
-export function migrateSnapshot(
-  snapshot: Snapshot,
+export function migrateState(
+  snapshot: StateReader,
   writer: Catalog,
   reader: Catalog,
   commitId: CommitHash,
   options: SyncSchemaOptions,
-): { snapshot: Snapshot; catalog: Catalog } {
+): { draft: DraftOverlay; catalog: Catalog } {
   const analysis = analyze(snapshot, writer, reader, commitId)
   const report = buildReport(commitId, analysis)
   const migrations: Readonly<Record<string, NodeMigrationFn>> = options.fieldMigrations ?? {}
   const keepDormant = (options.dormantPolicy ?? 'keep') === 'keep'
   const target = effectiveCatalog(reader, writer, keepDormant)
-  const draft = cloneSnapshot(snapshot)
+  const draft = new DraftOverlay(snapshot)
 
   // Required converters are resolved up front, before the draft is mutated, so
   // a missing converter never leaves a partially migrated draft behind.
@@ -369,8 +368,7 @@ export function migrateSnapshot(
   }
 
   writeCatalog(draft, target)
-  validateSnapshot(draft, target, commitId)
-  return { snapshot: draft, catalog: target }
+  return { draft, catalog: target }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -848,7 +846,7 @@ function migrationFailure(commitId: CommitHash, report: SchemaDriftReport, messa
 }
 
 function applyPromotionValue(
-  draft: Snapshot,
+  draft: StateWriter,
   source: StateReader,
   commitId: CommitHash,
   targetPath: Path,
@@ -910,7 +908,7 @@ function applyPromotionValue(
 }
 
 function writePromotedLeaf(
-  draft: Snapshot,
+  draft: StateWriter,
   targetPath: Path,
   targetSpec: LeafSchemaNode,
   value: Value | StateRef,
@@ -1023,14 +1021,19 @@ function isAncestorOfActiveRoot(reader: Catalog, path: Path): boolean {
  * Schema now covers. A dormant Writer root can become a field of an active
  * root (or vice versa), so root ancestry alone cannot decide what to delete.
  */
-function pruneDormantPath(draft: Snapshot, reader: Catalog, path: Path): void {
+function pruneDormantPath(draft: StateWriter, reader: Catalog, path: Path): void {
   if (isAncestorOfActiveRoot(reader, path)) {
-    // Active roots nested below a dormant ancestor keep their own subtrees.
-    const prefix = encodePathKey(path)
-    const activePrefixes = [...reader.roots.keys()]
-    for (const key of [...draft.keys()]) {
-      if (key.startsWith(prefix) && !activePrefixes.some((active) => key.startsWith(active)))
-        draft.delete(key)
+    // Keep complete active roots, traversing only the directories above them.
+    // All other children can be removed by prefix without enumerating leaves.
+    const pending: Path[] = [path]
+    while (pending.length > 0) {
+      const at = pending.pop()!
+      if (reader.roots.has(encodePathKey(at))) continue
+      for (const key of childKeys(draft, at)) {
+        const child = [...at, key]
+        if (isAncestorOfActiveRoot(reader, child)) pending.push(child)
+        else deleteTree(draft, child)
+      }
     }
     return
   }
@@ -1043,7 +1046,7 @@ function pruneDormantPath(draft: Snapshot, reader: Catalog, path: Path): void {
 }
 
 /** Delete children under `path` that the active Reader Schema does not declare. */
-function pruneCoveredPath(draft: Snapshot, path: Path, spec: SchemaNode): void {
+function pruneCoveredPath(draft: StateWriter, path: Path, spec: SchemaNode): void {
   if (spec.nodeKind === 'leaf') {
     for (const key of childKeys(draft, path))
       if (key !== '$val' && key !== '$meta') deleteTree(draft, [...path, key])
