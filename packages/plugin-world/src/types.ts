@@ -53,6 +53,7 @@ export interface CommitNode {
 }
 /** Optional CAS expectation for `commit({ ... advanceHead })`. */
 export interface AdvanceHeadInput {
+  /** Named cursor; aliases pointing at one commit remain independent Heads. */
   readonly name: string
   /**
    * When supplied (including `NONE`), the current head value must match
@@ -67,7 +68,10 @@ export interface CommitInput {
   readonly parentId: Option<CommitHash>
   readonly message: Value
   readonly diff?: StateDiff
-  /** Optionally validate and advance a named cursor atomically with the commit. */
+  /**
+   * Optionally validate and advance a named cursor atomically with the commit.
+   * Its leaf residency is prepared inside the transaction and published before events.
+   */
   readonly advanceHead?: string | AdvanceHeadInput
 }
 

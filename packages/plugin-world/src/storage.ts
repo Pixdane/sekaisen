@@ -15,6 +15,7 @@ import type {
   CommitNode,
   LeafEntry,
   OriginDirectoryNode,
+  OriginTreeNode,
   SqliteDriver,
   StateDiff,
   Value,
@@ -78,19 +79,61 @@ class CacheBox<T> {
   }
 }
 
+/** Strongly pinned leaf entry and the number of active Heads that reach it. */
+export interface HotEntry {
+  readonly box: CacheBox<LeafEntry>
+  readonly count: number
+}
+
+/**
+ * Prepared residency change for one Head transition.
+ *
+ * A `patch` carries the final state of every affected key (`undefined` releases
+ * the key); `clear` releases every key without walking the departing tree. An
+ * `undefined` {@link WorldStorage.prepareHot} result means no change at all.
+ */
+export type HotUpdate =
+  | { readonly kind: 'patch'; readonly entries: ReadonlyMap<string, HotEntry | undefined> }
+  | { readonly kind: 'clear' }
+
+const CLEAR_HOT: HotUpdate = Object.freeze({ kind: 'clear' })
+
+function hotKey(origin: CommitHash, pathKey: string): string {
+  return `e:${origin}:${pathKey}`
+}
+
+function childPathKey(pathKey: string, name: string): string {
+  return `${pathKey}${encoder.encode(name).byteLength}:${name}`
+}
+
+type HotJob =
+  | {
+      readonly kind: 'pair'
+      readonly oldNode: OriginTreeNode
+      readonly newNode: OriginTreeNode
+      readonly pathKey: string
+    }
+  | {
+      readonly kind: 'add' | 'remove'
+      readonly node: OriginTreeNode
+      readonly pathKey: string
+    }
+
 /**
  * SQLite-backed persistence and `WeakRef` cache manager for the commit forest.
  *
  * Reconstructs the `OriginIndexTree` and reference pin graph on startup,
- * keeps active `heads` leaves strongly pinned in `hot`, and lazily loads
- * cold leaf values or commit messages on demand.
+ * keeps active Head leaves strongly pinned with per-Head ownership counts,
+ * and lazily loads cold values or weak-only commit messages. Head transitions
+ * stage sparse residency patches and skip reference-shared index subtrees;
+ * live counts change only when the caller publishes a successful transaction.
  */
 export class WorldStorage {
   readonly commits = new Map<CommitHash, StoredCommit>()
   readonly heads = new Map<string, CommitHash>()
   readonly pins = new Map<CommitHash, Set<CommitHash>>()
   private readonly weakPool = new Map<string, WeakRef<CacheBox<LeafEntry | Value>>>()
-  private readonly hot = new Map<string, CacheBox<LeafEntry | Value>>()
+  private readonly hot = new Map<string, HotEntry>()
   private readonly registry = new FinalizationRegistry<{
     key: string
     ref: WeakRef<CacheBox<LeafEntry | Value>>
@@ -127,7 +170,7 @@ export class WorldStorage {
         }
         this.loadTopology()
       })
-      this.refreshHot()
+      this.initializeHot()
     } catch (cause) {
       if (cause instanceof InvariantError) throw cause
       throw new InvariantError('World storage initialization failed', { cause })
@@ -340,7 +383,7 @@ export class WorldStorage {
     return this.entryBox(id, pathKey).value
   }
   private entryBox(id: CommitHash, pathKey: string): CacheBox<LeafEntry> {
-    return this.cached(`e:${id}:${pathKey}`, () => {
+    return this.cached(hotKey(id, pathKey), () => {
       const row = this.driver
         .prepare(
           "SELECT op, val_type, val_raw, CASE WHEN typeof(val_raw) = 'text' THEN CAST(val_raw AS BLOB) ELSE NULL END AS text_bytes, typeof(val_raw) AS storage_class, CASE WHEN ref_commit_id IS NOT NULL THEN CAST(ref_commit_id AS BLOB) ELSE NULL END AS ref_id_bytes, CASE WHEN ref_path_key IS NOT NULL THEN CAST(ref_path_key AS BLOB) ELSE NULL END AS ref_path_bytes FROM diff_entries WHERE commit_id = ? AND path_key = CAST(? AS TEXT)",
@@ -519,37 +562,182 @@ export class WorldStorage {
       .run(encoder.encode(name), id)
   }
 
-  /** Hydrate and collect strong `CacheBox` references for all leaves reachable from `indices`. */
-  prepareHot(indices: Iterable<OriginDirectoryNode>) {
-    const next = new Map<string, CacheBox<LeafEntry | Value>>()
-    const stack: { node: OriginDirectoryNode; pathKey: string }[] = []
-    for (const index of indices) stack.push({ node: index, pathKey: '' })
+  /**
+   * Initialize the strong residency map once from the persisted `heads`.
+   *
+   * Active Heads are grouped by their exact index object and each distinct root
+   * is walked once with the group size as its weight, so aliases and no-op
+   * commits (which share an index object with their parent) keep per-Head
+   * counts without re-walking the same tree.
+   */
+  private initializeHot(): void {
+    const weights = new Map<OriginDirectoryNode, number>()
+    for (const id of this.heads.values()) {
+      const index = this.commits.get(id)!.index
+      weights.set(index, (weights.get(index) ?? 0) + 1)
+    }
+    const stack: { node: OriginTreeNode; pathKey: string; weight: number }[] = []
+    for (const [index, weight] of weights) stack.push({ node: index, pathKey: '', weight })
     while (stack.length > 0) {
-      const { node, pathKey } = stack.pop()!
-      for (const [name, child] of node.children) {
-        const childKey = `${pathKey}${encoder.encode(name).byteLength}:${name}`
-        if (child.kind === 'dir') stack.push({ node: child, pathKey: childKey })
-        else {
-          next.set(
-            `e:${child.originCommitId}:${childKey}`,
-            this.entryBox(child.originCommitId, childKey),
-          )
-        }
+      const { node, pathKey, weight } = stack.pop()!
+      if (node.kind === 'dir') {
+        for (const [name, child] of node.children)
+          stack.push({ node: child, pathKey: childPathKey(pathKey, name), weight })
+        continue
+      }
+      const key = hotKey(node.originCommitId, pathKey)
+      const current = this.hot.get(key)
+      this.hot.set(
+        key,
+        Object.freeze({
+          box: current?.box ?? this.entryBox(node.originCommitId, pathKey),
+          count: (current?.count ?? 0) + weight,
+        }),
+      )
+    }
+  }
+
+  /**
+   * Prepare the residency change for one Head transition without mutating `hot`.
+   *
+   * `oldIndex`/`newIndex` are that Head's indexes before and after the
+   * transition (`undefined` = absent Head); `heads` must still describe the
+   * pre-transition topology. Added leaves that are not already resident are
+   * hydrated here, so callers run this inside the transaction that writes the
+   * new Head state. Counts are per Head: every alias contributes separately.
+   *
+   * Preparation may populate weak entries, but never changes strong ownership.
+   * Install the returned plan only after that transaction succeeds, before any
+   * other Head transition. A sole Head leaving for an absent or empty state
+   * produces a clear plan without walking the old tree.
+   */
+  prepareHot(
+    oldIndex: OriginDirectoryNode | undefined,
+    newIndex: OriginDirectoryNode | undefined,
+  ): HotUpdate | undefined {
+    if (oldIndex === newIndex) return undefined
+    if (
+      oldIndex !== undefined &&
+      this.heads.size === 1 &&
+      (newIndex === undefined || newIndex.children.size === 0)
+    )
+      return CLEAR_HOT
+    const patch = new Map<string, HotEntry | undefined>()
+    const stack: HotJob[] = []
+    if (oldIndex === undefined) {
+      if (newIndex !== undefined) stack.push({ kind: 'add', node: newIndex, pathKey: '' })
+    } else if (newIndex === undefined) {
+      stack.push({ kind: 'remove', node: oldIndex, pathKey: '' })
+    } else {
+      stack.push({ kind: 'pair', oldNode: oldIndex, newNode: newIndex, pathKey: '' })
+    }
+    while (stack.length > 0) {
+      const job = stack.pop()!
+      if (job.kind === 'pair') {
+        this.diffNode(job.oldNode, job.newNode, job.pathKey, patch, stack)
+      } else if (job.node.kind === 'dir') {
+        for (const [name, child] of job.node.children)
+          stack.push({ kind: job.kind, node: child, pathKey: childPathKey(job.pathKey, name) })
+      } else if (job.kind === 'add') {
+        this.addLeaf(job.node.originCommitId, job.pathKey, patch)
+      } else {
+        this.removeLeaf(job.node.originCommitId, job.pathKey, patch)
       }
     }
-    return next
+    return patch.size > 0 ? { kind: 'patch', entries: patch } : undefined
   }
 
-  /** Atomically replace the strongly pinned `hot` leaf set for active `heads`. */
-  installHot(next: ReadonlyMap<string, CacheBox<LeafEntry | Value>>): void {
-    this.hot.clear()
-    for (const [key, box] of next) this.hot.set(key, box)
+  /** Apply a plan from {@link prepareHot}; no SQL is issued and no tree is walked. */
+  installHot(update: HotUpdate): void {
+    if (update.kind === 'clear') {
+      this.hot.clear()
+      return
+    }
+    for (const [key, entry] of update.entries) {
+      if (entry === undefined) this.hot.delete(key)
+      else this.hot.set(key, entry)
+    }
   }
 
-  /** Rebuild the `hot` strong-reference map from all currently active `heads`. */
-  refreshHot(): void {
-    this.installHot(
-      this.prepareHot([...new Set(this.heads.values())].map((id) => this.commits.get(id)!.index)),
+  /**
+   * Walk one `(oldNode, newNode)` pair iteratively, enqueueing only changed
+   * children. Identical node objects are skipped before their children or
+   * descendant names are read, and equal-origin leaf pairs cancel outright.
+   */
+  private diffNode(
+    oldNode: OriginTreeNode,
+    newNode: OriginTreeNode,
+    pathKey: string,
+    patch: Map<string, HotEntry | undefined>,
+    stack: HotJob[],
+  ): void {
+    if (oldNode === newNode) return
+    if (oldNode.kind === 'leaf') {
+      if (newNode.kind === 'leaf') {
+        if (oldNode.originCommitId === newNode.originCommitId) return
+        this.removeLeaf(oldNode.originCommitId, pathKey, patch)
+        this.addLeaf(newNode.originCommitId, pathKey, patch)
+        return
+      }
+      this.removeLeaf(oldNode.originCommitId, pathKey, patch)
+      stack.push({ kind: 'add', node: newNode, pathKey })
+      return
+    }
+    if (newNode.kind === 'leaf') {
+      stack.push({ kind: 'remove', node: oldNode, pathKey })
+      this.addLeaf(newNode.originCommitId, pathKey, patch)
+      return
+    }
+    for (const [name, oldChild] of oldNode.children) {
+      const newChild = newNode.children.get(name)
+      if (newChild === undefined) {
+        stack.push({ kind: 'remove', node: oldChild, pathKey: childPathKey(pathKey, name) })
+      } else if (newChild !== oldChild) {
+        stack.push({
+          kind: 'pair',
+          oldNode: oldChild,
+          newNode: newChild,
+          pathKey: childPathKey(pathKey, name),
+        })
+      }
+    }
+    for (const [name, newChild] of newNode.children) {
+      if (oldNode.children.has(name)) continue
+      stack.push({ kind: 'add', node: newChild, pathKey: childPathKey(pathKey, name) })
+    }
+  }
+
+  /** Record one Head leaving a physical leaf coordinate; never mutates live counts. */
+  private removeLeaf(
+    origin: CommitHash,
+    pathKey: string,
+    patch: Map<string, HotEntry | undefined>,
+  ): void {
+    const key = hotKey(origin, pathKey)
+    const current = this.hot.get(key)
+    if (!current || current.count < 1)
+      throw new InvariantError(`Hot residency underflow: ${origin}/${pathKey}`)
+    if (current.count === 1) {
+      patch.set(key, undefined)
+      return
+    }
+    patch.set(key, Object.freeze({ box: current.box, count: current.count - 1 }))
+  }
+
+  /** Record one Head entering a physical leaf coordinate, hydrating only absent boxes. */
+  private addLeaf(
+    origin: CommitHash,
+    pathKey: string,
+    patch: Map<string, HotEntry | undefined>,
+  ): void {
+    const key = hotKey(origin, pathKey)
+    const current = this.hot.get(key)
+    patch.set(
+      key,
+      Object.freeze({
+        box: current?.box ?? this.entryBox(origin, pathKey),
+        count: (current?.count ?? 0) + 1,
+      }),
     )
   }
 

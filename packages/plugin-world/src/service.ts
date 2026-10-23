@@ -144,6 +144,12 @@ function transformView(
  * Mounted on `ctx.world`; manages multi-root commit topology, named `heads`
  * with CAS protection, transparent SQLite hydration, leaf deletion, and
  * atomic prefix-root group rebasing.
+ *
+ * Active Head leaves are strongly resident with per-Head ownership counts.
+ * Moves compare persistent origin indexes and skip reference-shared subtrees;
+ * SQL hydration is prepared inside the transaction and residency is published
+ * before events only after persistence succeeds. Adding aliases or moving
+ * between unshared trees can still require a subtree walk.
  */
 export class WorldService extends Service<WorldConfig> {
   private readonly storage: WorldStorage
@@ -292,44 +298,51 @@ export class WorldService extends Service<WorldConfig> {
     return id === undefined ? NONE : some(id)
   }
 
-  /** Create or move named cursor `name` to `id`, optionally checking `expected` via CAS. */
+  /**
+   * Create or move named cursor `name` to `id`, optionally checking `expected`
+   * via CAS. Each name owns its reachable leaves independently of aliases.
+   * Hydration and persistence must succeed before the cursor and residency
+   * changes are published; `world/head-updated` observes the final state.
+   */
   setHead(name: string, id: CommitHash, expected?: Option<CommitHash>): Result<void, WorldError> {
     return this.write(() => {
       this.checkName(name)
-      this.requireCommit(id)
+      const target = this.requireCommit(id)
       this.checkCas(name, expected)
-      if (sameOption(this.getHead(name), some(id))) return
-      const heads = new Map(this.storage.heads).set(name, id)
+      const previous = this.storage.heads.get(name)
+      if (previous === id) return
+      const oldIndex = previous === undefined ? undefined : this.requireCommit(previous).index
       const hot = this.storage.driver.transaction(() => {
         this.storage.writeHead(name, id)
-        return this.storage.prepareHot(
-          [...new Set(heads.values())].map((target) => this.requireCommit(target).index),
-        )
+        return this.storage.prepareHot(oldIndex, target.index)
       })
       this.storage.heads.set(name, id)
-      this.storage.installHot(hot)
+      if (hot) this.storage.installHot(hot)
       this.emitHead(name, some(id))
     })
   }
 
-  /** Delete named cursor `name`, optionally checking `expected` via CAS. */
+  /**
+   * Delete named cursor `name`, optionally checking `expected` via CAS.
+   * Leaves held by other Heads remain strongly resident. Removing the final
+   * Head releases residency without rescanning its departing state tree.
+   * Persistence failure leaves both the cursor and live ownership counts intact.
+   */
   deleteHead(name: string, expected?: Option<CommitHash>): Result<void, WorldError> {
     return this.write(() => {
       this.checkName(name)
       this.checkCas(name, expected)
-      if (!this.storage.heads.has(name)) fail({ kind: 'head_not_found', headName: name })
-      const heads = new Map(this.storage.heads)
-      heads.delete(name)
+      const previous = this.storage.heads.get(name)
+      if (previous === undefined) fail({ kind: 'head_not_found', headName: name })
+      const oldIndex = this.requireCommit(previous).index
       const hot = this.storage.driver.transaction(() => {
         this.storage.driver
           .prepare('DELETE FROM heads WHERE name = CAST(? AS TEXT)')
           .run(new TextEncoder().encode(name))
-        return this.storage.prepareHot(
-          [...new Set(heads.values())].map((target) => this.requireCommit(target).index),
-        )
+        return this.storage.prepareHot(oldIndex, undefined)
       })
       this.storage.heads.delete(name)
-      this.storage.installHot(hot)
+      if (hot) this.storage.installHot(hot)
       this.emitHead(name, NONE)
     })
   }
@@ -510,7 +523,12 @@ export class WorldService extends Service<WorldConfig> {
     })
   }
 
-  /** Atomically validate, persist, and index a new commit node (and optional head advance). */
+  /**
+   * Atomically validate, persist and index a commit, optionally advancing a Head.
+   * Head residency updates use only the affected origin branches and are
+   * published with topology before events. Replaying an existing canonical
+   * commit reuses its stored index; it never creates a duplicate commit event.
+   */
   commit(input: CommitInput): Result<CommitNode, WorldError> {
     return this.write(() => this.commitInternal(input))
   }
@@ -518,12 +536,13 @@ export class WorldService extends Service<WorldConfig> {
     if (input.parentId.kind === 'some') this.requireCommit(input.parentId.value)
     const advance =
       typeof input.advanceHead === 'string' ? { name: input.advanceHead } : input.advanceHead
+    let previousHead: CommitHash | undefined
     if (advance) {
       this.checkName(advance.name)
-      const actual = this.getHead(advance.name)
+      previousHead = this.storage.heads.get(advance.name)
       this.checkCas(
         advance.name,
-        advance.expected ?? (actual.kind === 'some' ? input.parentId : undefined),
+        advance.expected ?? (previousHead === undefined ? undefined : input.parentId),
       )
     }
     let message: Value
@@ -539,24 +558,25 @@ export class WorldService extends Service<WorldConfig> {
     }
     const parentId = input.parentId.kind === 'some' ? some(input.parentId.value) : NONE
     const id = hashCommit(parentId, message, diff)
-    const index = applyIndex(
-      parentId.kind === 'some' ? this.requireCommit(parentId.value).index : emptyIndex(id),
-      diff,
-      id,
-    )
+    const existing = this.storage.commits.get(id)
+    const isNew = existing === undefined
+    // Preserve canonical object sharing when an existing hash is replayed.
+    const index =
+      existing?.index ??
+      applyIndex(
+        parentId.kind === 'some' ? this.requireCommit(parentId.value).index : emptyIndex(id),
+        diff,
+        id,
+      )
     const node = Object.freeze({ id, parentId, message, diff })
-    const isNew = !this.hasCommit(id)
-    const headChanged = advance !== undefined && !sameOption(this.getHead(advance.name), some(id))
-    const heads = new Map(this.storage.heads)
-    if (advance) heads.set(advance.name, id)
+    const headChanged = advance !== undefined && previousHead !== id
     const hot = this.storage.driver.transaction(() => {
       if (isNew) this.storage.insert(node)
       if (headChanged && advance) this.storage.writeHead(advance.name, id)
       return headChanged
         ? this.storage.prepareHot(
-            [...new Set(heads.values())].map((target) =>
-              target === id ? index : this.requireCommit(target).index,
-            ),
+            previousHead === undefined ? undefined : this.requireCommit(previousHead).index,
+            index,
           )
         : undefined
     })
