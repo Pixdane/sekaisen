@@ -1,38 +1,12 @@
 import type { Option, Result } from '@sekaisen/core'
-import { InvariantError, isOption, NONE, some } from '@sekaisen/core'
-import type {
-  AdvanceHeadInput,
-  CommitHash,
-  CommitNode,
-  Path,
-  StateDiff,
-  StateRef,
-  Value,
-} from '@sekaisen/plugin-world'
-import { encodePathKey } from '@sekaisen/plugin-world'
+import { InvariantError } from '@sekaisen/core'
+import type { CommitHash, CommitNode, Path, StateRef } from '@sekaisen/plugin-world'
 import type { Context } from 'cordis'
 import { Service } from 'cordis'
-import { assertIdentifier, cloneSchema, cloneStateRef, SchemaFailure } from './builders.ts'
-import { checkDrift, migrateState } from './evolution.ts'
-import { validateLinkRegistration, validateStateLinks } from './links.ts'
-import { decodeMessage, encodeMessage, makeMessagePrism } from './message.ts'
-import { getLensRoot, getLensRoute, makeLens } from './optics.ts'
-import { DraftOverlay } from './overlay.ts'
-import type { Catalog, MutableCatalog, StateReader } from './runtime.ts'
-import {
-  cloneCatalog,
-  copyValue,
-  EMPTY_STATE,
-  effectiveCatalog,
-  emptyCatalog,
-  inspectAt,
-  materializeDefaultNode,
-  readCatalog,
-  schemaAt,
-  validateState,
-  writeCatalog,
-} from './runtime.ts'
-import { attempt, ReadView, Transaction, unwrap } from './transaction.ts'
+import { SchemaCommitter } from './commit.ts'
+import { SchemaHistory } from './history.ts'
+import { SchemaRegistry } from './registry.ts'
+import { attempt } from './transaction.ts'
 import type {
   AnyReadableLens,
   CommitValidatorFn,
@@ -56,71 +30,15 @@ import type {
   SchemaError,
   SchemaFieldsOf,
   SchemaNode,
-  SchemaNodeOf,
   SchemaTransaction,
   StructLens,
   SyncSchemaOptions,
   TypedCommitMessage,
 } from './types.ts'
-import { validateChangedState } from './validation.ts'
-import { WorldStateReader, worldResult } from './world-reader.ts'
 
 declare module 'cordis' {
   interface Context {
     schema: SchemaService
-  }
-}
-const WRITER_CATALOG_LIMIT = 64
-const VALIDATED_COMMIT_LIMIT = 256
-const SCHEMA_PATH: Path = Object.freeze(['$schemas'])
-
-interface Augmentation {
-  path: Path
-  fields: Readonly<Record<string, SchemaNode>>
-}
-interface ServiceState {
-  roots: Map<symbol, { path: Path; schema: SchemaNode }>
-  augmentations: Map<symbol, Augmentation>
-  messages: Map<symbol, { kind: string; schema: MessageStructSchemaNode }>
-  validators: Set<CommitValidatorFn>
-  writerCatalogs: Map<CommitHash, Catalog>
-  /** Bounded LRU certificates for Writer data under captured Reader revisions. */
-  validatedCommits: Map<CommitHash, symbol>
-  /** Changes on Reader registration/disposal, never on validator registration. */
-  readerRevision: symbol
-  busy: boolean
-}
-function schemaPath(lens: StructLens): Path {
-  return [
-    ...getLensRoot(lens),
-    ...getLensRoute(lens).map((step) => (step.kind === 'entry' ? '*' : step.key)),
-  ]
-}
-function replaceSchema(
-  catalog: MutableCatalog,
-  path: Path,
-  transform: (node: SchemaNode) => SchemaNode,
-): void {
-  for (const [key, root] of catalog.roots) {
-    if (!root.path.every((segment, i) => segment === path[i])) continue
-    function apply(node: SchemaNode, depth: number): SchemaNode {
-      if (depth === path.length) return transform(node)
-      const field = path[depth]!
-      if (node.nodeKind === 'map' && field === '*')
-        return cloneSchema({ ...node, valueSchema: apply(node.valueSchema, depth + 1) })
-      if (node.nodeKind === 'struct' && Object.hasOwn(node.fields, field))
-        return cloneSchema({
-          ...node,
-          fields: { ...node.fields, [field]: apply(node.fields[field]!, depth + 1) },
-        })
-      throw new SchemaFailure({
-        kind: 'schema_conflict',
-        path,
-        reason: 'augment_target_not_struct',
-      })
-    }
-    catalog.roots.set(key, { path: root.path, schema: apply(root.schema, root.path.length) })
-    return
   }
 }
 
@@ -144,7 +62,10 @@ function replaceSchema(
 export class SchemaService extends Service {
   /** World owns physical commits, persistence and atomic head/CAS operations. */
   static inject = ['world']
-  private readonly state: ServiceState
+  private readonly registry: SchemaRegistry
+  private readonly history: SchemaHistory
+  private readonly committer: SchemaCommitter
+  private busy = false
   /**
    * Attach `ctx.schema` to a context with an existing `ctx.world` service.
    * @throws Error if the world dependency is missing.
@@ -152,70 +73,9 @@ export class SchemaService extends Service {
   constructor(ctx: Context) {
     if (!ctx.world) throw new Error('SchemaService requires ctx.world')
     super(ctx, 'schema')
-    this.state = {
-      roots: new Map(),
-      augmentations: new Map(),
-      messages: new Map(),
-      validators: new Set(),
-      writerCatalogs: new Map(),
-      validatedCommits: new Map(),
-      readerRevision: Symbol(),
-      busy: false,
-    }
-  }
-  private catalog(): Catalog {
-    const catalog = emptyCatalog()
-    for (const root of this.state.roots.values())
-      catalog.roots.set(encodePathKey(root.path), {
-        path: root.path,
-        schema: cloneSchema(root.schema),
-      })
-    for (const augmentation of this.state.augmentations.values()) {
-      replaceSchema(catalog, augmentation.path, (node) => {
-        if (node.nodeKind !== 'struct')
-          throw new SchemaFailure({
-            kind: 'schema_conflict',
-            path: augmentation.path,
-            reason: 'augment_target_not_struct',
-          })
-        for (const key of Object.keys(augmentation.fields))
-          if (Object.hasOwn(node.fields, key))
-            throw new SchemaFailure({
-              kind: 'schema_conflict',
-              path: [...augmentation.path, key],
-              reason: 'field_name_collision',
-            })
-        return cloneSchema({ ...node, fields: { ...node.fields, ...augmentation.fields } })
-      })
-    }
-    for (const { kind, schema } of this.state.messages.values()) catalog.messages.set(kind, schema)
-    return catalog
-  }
-  /**
-   * Reuse a parsed Writer catalog only while its `$schemas` directory revision
-   * matches. Check the requested commit first, even on hits, so deleted commits
-   * never become readable through the cache. Missing/leaf catalogs and parse
-   * failures are not cached; errors retain the requested commit's identity.
-   *
-   * Keep at most 64 successfully parsed revisions in insertion order. Cached
-   * catalogs are read-only inputs: Reader registrations remain freshly scoped,
-   * and migration/merge code builds separate mutable maps.
-   */
-  private writerCatalog(commitId: CommitHash, source?: StateReader): Catalog {
-    const info = worldResult(this.ctx.world.getNodeInfo(commitId, SCHEMA_PATH))
-    const revision =
-      info.kind === 'some' && info.value.nodeKind === 'dir' ? info.value.lastModifiedAt : undefined
-    const cache = this.state.writerCatalogs
-    if (revision !== undefined) {
-      const cached = cache.get(revision)
-      if (cached !== undefined) return cached
-    }
-    const catalog = readCatalog(source ?? new WorldStateReader(this.ctx.world, commitId), commitId)
-    if (revision !== undefined) {
-      if (cache.size >= WRITER_CATALOG_LIMIT) cache.delete(cache.keys().next().value!)
-      cache.set(revision, catalog)
-    }
-    return catalog
+    this.registry = new SchemaRegistry()
+    this.history = new SchemaHistory(this.registry)
+    this.committer = new SchemaCommitter(this.registry, this.history)
   }
   /**
    * Register a copied Reader root and return a typed, scoped lens. A root path
@@ -225,38 +85,7 @@ export class SchemaService extends Service {
    * @see LensFor
    */
   define<S extends SchemaNode>(path: Path, node: S): Result<LensFor<S>, SchemaError> {
-    return attempt(() => {
-      if (!path.length) assertIdentifier('')
-      for (const segment of path) assertIdentifier(segment)
-      const key = encodePathKey(path)
-      for (const root of this.state.roots.values()) {
-        const other = encodePathKey(root.path)
-        if (key.startsWith(other) || other.startsWith(key))
-          throw new SchemaFailure({
-            kind: 'schema_conflict',
-            path,
-            reason: key === other ? 'duplicate_definition' : 'overlapping_root_path',
-          })
-      }
-      const schema = cloneSchema(node)
-      validateLinkRegistration(schema, path)
-      const id = Symbol()
-      const ownedPath = Object.freeze([...path])
-      this.ctx.effect(() => {
-        this.state.roots.set(id, { path: ownedPath, schema })
-        try {
-          this.catalog()
-        } catch (cause) {
-          this.state.roots.delete(id)
-          throw cause
-        }
-        this.state.readerRevision = Symbol()
-        return () => {
-          if (this.state.roots.delete(id)) this.state.readerRevision = Symbol()
-        }
-      })
-      return makeLens<S>(ownedPath, cloneSchema(schema) as SchemaNodeOf<S>)
-    })
+    return attempt(() => this.registry.define(this.ctx, path, node))
   }
   /**
    * Register non-required extra fields for an active struct schema and return
@@ -274,59 +103,7 @@ export class SchemaService extends Service {
     target: StructLens<TBase, TCustom, TPresence>,
     extraFields: TExtra,
   ): Result<StructLens<SchemaFieldsOf<TBase & TExtra>, TCustom, TPresence>, SchemaError> {
-    return attempt(() => {
-      const path = schemaPath(target)
-      const active = schemaAt(this.catalog(), path)
-      if (active?.nodeKind !== 'struct')
-        throw new SchemaFailure({
-          kind: 'schema_conflict',
-          path,
-          reason: 'augment_target_not_struct',
-        })
-      function check(node: SchemaNode, at: Path): void {
-        if (node.presence.mode === 'required')
-          throw new SchemaFailure({
-            kind: 'schema_conflict',
-            path: at,
-            reason: 'mandatory_field_in_augment',
-          })
-        if (node.nodeKind === 'struct')
-          for (const [key, child] of Object.entries(node.fields)) check(child, [...at, key])
-        if (node.nodeKind === 'map') check(node.valueSchema, [...at, '*'])
-      }
-      const fields: Record<string, SchemaNode> = Object.create(null)
-      for (const [key, node] of Object.entries(extraFields)) {
-        assertIdentifier(key)
-        if (Object.hasOwn(active.fields, key))
-          throw new SchemaFailure({
-            kind: 'schema_conflict',
-            path: [...path, key],
-            reason: 'field_name_collision',
-          })
-        fields[key] = cloneSchema(node)
-        // Augmented fields are attached to an existing Struct instance, so a
-        // direct or Map-nested link here has a valid source boundary.
-        validateLinkRegistration(fields[key]!, [...path, key], true)
-        check(fields[key]!, [...path, key])
-      }
-      const id = Symbol()
-      this.ctx.effect(() => {
-        this.state.augmentations.set(id, { path, fields })
-        this.state.readerRevision = Symbol()
-        return () => {
-          if (this.state.augmentations.delete(id)) this.state.readerRevision = Symbol()
-        }
-      })
-      const schema = cloneSchema({
-        ...target.schema,
-        fields: { ...target.schema.fields, ...fields },
-      })
-      return makeLens(target.path, schema, getLensRoot(target), getLensRoute(target)) as StructLens<
-        SchemaFieldsOf<TBase & TExtra>,
-        TCustom,
-        TPresence
-      >
-    })
+    return attempt(() => this.registry.augment(this.ctx, target, extraFields))
   }
   /**
    * Register a unique message kind in the calling scope. Message schemas cannot
@@ -338,27 +115,7 @@ export class SchemaService extends Service {
     kind: K,
     node: S,
   ): Result<MessagePrism<K, S>, SchemaError> {
-    return attempt(() => {
-      assertIdentifier(kind)
-      if (this.catalog().messages.has(kind))
-        throw new SchemaFailure({
-          kind: 'schema_conflict',
-          path: [kind],
-          reason: 'duplicate_definition',
-        })
-      // Cloning preserves the message-only AST constraint on S.
-      const schema = cloneSchema(node) as SchemaNodeOf<S> & MessageStructSchemaNode
-      const prism = makeMessagePrism<K, S>(kind, cloneSchema(schema) as SchemaNodeOf<S>)
-      const id = Symbol()
-      this.ctx.effect(() => {
-        this.state.messages.set(id, { kind, schema })
-        this.state.readerRevision = Symbol()
-        return () => {
-          if (this.state.messages.delete(id)) this.state.readerRevision = Symbol()
-        }
-      })
-      return prism
-    })
+    return attempt(() => this.registry.defineMessage(this.ctx, kind, node))
   }
   /**
    * Register a synchronous business rule over the final, structurally validated
@@ -406,14 +163,7 @@ export class SchemaService extends Service {
    * ```
    */
   addCommitValidator(validator: CommitValidatorFn): () => void {
-    return this.ctx.effect(() => {
-      // Each registration has its own identity, even if the function is reused.
-      const registered: CommitValidatorFn = (input) => validator(input)
-      this.state.validators.add(registered)
-      return () => {
-        this.state.validators.delete(registered)
-      }
-    })
+    return this.registry.addCommitValidator(this.ctx, validator)
   }
   /**
    * Capture a fixed World commit and current Reader catalog for repeated logical
@@ -423,15 +173,7 @@ export class SchemaService extends Service {
    * @see ReadonlySchemaView
    */
   viewAt(commitId: CommitHash): Result<ReadonlySchemaView, SchemaError> {
-    return attempt(() => {
-      const source = new WorldStateReader(this.ctx.world, commitId)
-      return new ReadView(
-        source,
-        this.writerCatalog(commitId, source),
-        this.catalog(),
-        commitId,
-      ).readonlyView()
-    })
+    return attempt(() => this.history.viewAt(this.ctx, commitId))
   }
   /**
    * Read a lens through the current Reader schema. Optional ancestor/member
@@ -444,7 +186,7 @@ export class SchemaService extends Service {
     commitId: CommitHash,
     lens: L,
   ): Result<Option<LensOutput<L>>, SchemaError> {
-    return attempt(() => unwrap(unwrap(this.viewAt(commitId)).get(lens)))
+    return attempt(() => this.history.get(this.ctx, commitId, lens))
   }
   /**
    * Read a copied leaf value with its instance metadata and effective spec.
@@ -455,14 +197,14 @@ export class SchemaService extends Service {
     commitId: CommitHash,
     lens: FieldLens<L> | CustomFieldLens<L>,
   ): Result<Option<FieldValueWithMeta<LeafValueTypeMap[L['valueKind']]>>, SchemaError> {
-    return attempt(() => unwrap(unwrap(this.viewAt(commitId)).getWithMeta(lens)))
+    return attempt(() => this.history.getWithMeta(this.ctx, commitId, lens))
   }
   /**
    * List concrete Map member IDs in path order; a logically absent Map yields `[]`.
    * As with a Map read, member values are still read and validated before listing.
    */
   listKeys(commitId: CommitHash, lens: MapLens): Result<readonly string[], SchemaError> {
-    return attempt(() => unwrap(unwrap(this.viewAt(commitId)).listKeys(lens)))
+    return attempt(() => this.history.listKeys(this.ctx, commitId, lens))
   }
   /**
    * Inspect a logical path using the commit's Writer Schema, including dormant
@@ -473,10 +215,7 @@ export class SchemaService extends Service {
     commitId: CommitHash,
     path: Path,
   ): Result<Option<HistoricalNodeInspection>, SchemaError> {
-    return attempt(() => {
-      const source = new WorldStateReader(this.ctx.world, commitId)
-      return inspectAt(source, this.writerCatalog(commitId, source), this.catalog(), commitId, path)
-    })
+    return attempt(() => this.history.inspectInstance(this.ctx, commitId, path))
   }
   /**
    * Read a plain string as `{ kind: '$text', data: message }`, or decode binary
@@ -486,24 +225,7 @@ export class SchemaService extends Service {
    * Only the message and Writer catalog are loaded, not unrelated state payloads.
    */
   getMessage(commitId: CommitHash): Result<TypedCommitMessage, SchemaError> {
-    return attempt(() => {
-      const message = worldResult(this.ctx.world.getMessage(commitId))
-      if (typeof message === 'string') return Object.freeze({ kind: '$text', data: message })
-      if (!(message instanceof Uint8Array))
-        throw new SchemaFailure({
-          kind: 'message_decode_error',
-          commitId,
-          reason: 'Expected encoded message bytes or a plain string',
-        })
-      const writer = this.writerCatalog(commitId)
-      try {
-        return decodeMessage(message, (kind) => writer.messages.get(kind))
-      } catch (cause) {
-        if (cause instanceof SchemaFailure)
-          throw new SchemaFailure({ kind: 'message_decode_error', commitId, reason: cause.message })
-        throw cause
-      }
-    })
+    return attempt(() => this.history.getMessage(this.ctx, commitId))
   }
   /**
    * Decode with the historical Writer catalog, then validate/normalize through
@@ -514,7 +236,7 @@ export class SchemaService extends Service {
     commitId: CommitHash,
     prism: MessagePrism<K, S>,
   ): Result<Option<InferCoreOutput<S>>, SchemaError> {
-    return attempt(() => unwrap(prism.parse(unwrap(this.getMessage(commitId)))))
+    return attempt(() => this.history.getMessageAs(this.ctx, commitId, prism))
   }
   /**
    * Resolve an arbitrary state reference.
@@ -531,136 +253,16 @@ export class SchemaService extends Service {
    * @remarks Invalid refs and unreadable commits return structured failures.
    */
   resolveRef(ref: StateRef): Result<ResolvedStateRefValue, SchemaError> {
-    return attempt(() => {
-      const checked = cloneStateRef(ref)
-      if (checked.path[0] !== '$message')
-        return Object.freeze({
-          targetKind: 'state_node' as const,
-          inspection: unwrap(this.inspectInstance(checked.commitId, checked.path)),
-        })
-      const message = unwrap(this.getMessage(checked.commitId))
-      let current: unknown = message.data
-      for (const segment of checked.path.slice(1)) {
-        if (isOption(current)) current = current.kind === 'none' ? undefined : current.value
-        if (
-          current === null ||
-          typeof current !== 'object' ||
-          Array.isArray(current) ||
-          current instanceof Uint8Array
-        )
-          return Object.freeze({
-            targetKind: 'commit_message' as const,
-            messageKind: message.kind,
-            value: NONE as Option<unknown>,
-          })
-        if (!Object.hasOwn(current, segment))
-          return Object.freeze({
-            targetKind: 'commit_message' as const,
-            messageKind: message.kind,
-            value: NONE as Option<unknown>,
-          })
-        current = (current as Record<string, unknown>)[segment]
-      }
-      const value: Option<unknown> = isOption(current)
-        ? current
-        : current === undefined
-          ? NONE
-          : some(current)
-      return Object.freeze({
-        targetKind: 'commit_message' as const,
-        messageKind: message.kind,
-        value,
-      })
-    })
+    return attempt(() => this.history.resolveRef(this.ctx, ref))
   }
   private write<T>(fn: () => T): Result<T, SchemaError> {
-    if (this.state.busy) throw new InvariantError('Reentrant schema write operation')
-    this.state.busy = true
+    if (this.busy) throw new InvariantError('Reentrant schema write operation')
+    this.busy = true
     try {
       return attempt(fn)
     } finally {
-      this.state.busy = false
+      this.busy = false
     }
-  }
-  private parent(options: SchemaCommitOptions): Option<CommitHash> {
-    if (options.parentId !== undefined) return options.parentId
-    if (options.head !== undefined)
-      return this.ctx.world.getHead(
-        typeof options.head === 'string' ? options.head : options.head.name,
-      )
-    return NONE
-  }
-  /**
-   * Validate one final draft, run business rules and atomically publish it.
-   * Positive records are installed only after World success, using the Reader
-   * snapshot captured before callbacks/converters, validators and observers.
-   */
-  private finish(
-    draft: DraftOverlay,
-    catalog: Catalog,
-    reader: Catalog,
-    parentId: Option<CommitHash>,
-    message: Value,
-    readerRevision: symbol,
-    mode: 'full' | 'incremental',
-    head?: string | AdvanceHeadInput,
-  ): CommitNode {
-    const commitId = parentId.kind === 'some' ? parentId.value : ('' as CommitHash)
-    let diff: StateDiff
-    if (mode === 'incremental') {
-      diff = draft.compileDiff()
-      validateChangedState(draft, catalog, commitId, diff)
-    } else {
-      // Unknown parents are checked after mutation, so callbacks may repair
-      // malformed values. Keep their validation-before-diff error ordering.
-      validateState(draft, catalog, commitId)
-      diff = draft.compileDiff()
-    }
-    // Link semantics are re-checked on the final state regardless of the write
-    // path that produced it (low-level draft writes, migrations, cascades).
-    validateStateLinks(draft, catalog)
-    const view = new ReadView(draft, catalog, reader, commitId).readonlyView()
-    for (const validator of [...this.state.validators]) {
-      const exposedDiff: StateDiff = Object.freeze(
-        diff.map((op) =>
-          Object.freeze(
-            op.op === 'set'
-              ? { ...op, value: copyValue(op.value) }
-              : op.op === 'ref'
-                ? { ...op, ref: copyValue(op.ref) }
-                : { ...op },
-          ),
-        ),
-      )
-      const result = validator({ parentId, draft: view, diff: exposedDiff })
-      if (!result.ok) throw new SchemaFailure({ kind: 'validator_rejected', ...result.error })
-    }
-    const node = worldResult(
-      this.ctx.world.commit({
-        parentId,
-        message,
-        diff,
-        ...(head === undefined
-          ? {}
-          : {
-              advanceHead:
-                typeof head === 'string'
-                  ? { name: head, expected: parentId }
-                  : { ...head, expected: head.expected ?? parentId },
-            }),
-      }),
-    )
-    // Capture the operation's Reader revision, not registrations changed by
-    // callbacks, validators or World observers while this operation was active.
-    const validated = this.state.validatedCommits
-    if (mode === 'incremental' && parentId.kind === 'some') {
-      validated.delete(parentId.value)
-      validated.set(parentId.value, readerRevision)
-    }
-    validated.delete(node.id)
-    if (validated.size >= VALIDATED_COMMIT_LIMIT) validated.delete(validated.keys().next().value!)
-    validated.set(node.id, readerRevision)
-    return node
   }
   /**
    * Mutate a lazy copy-on-write draft synchronously, validate its final
@@ -692,75 +294,7 @@ export class SchemaService extends Service {
     options: SchemaCommitOptions,
     mutate?: (tx: SchemaTransaction) => void | Result<void, SchemaError>,
   ): Result<CommitNode, SchemaError> {
-    return this.write(() => {
-      const parentId = this.parent(options)
-      const commitId = parentId.kind === 'some' ? parentId.value : ('' as CommitHash)
-      const before =
-        parentId.kind === 'some'
-          ? new WorldStateReader(this.ctx.world, parentId.value)
-          : EMPTY_STATE
-      const reader = this.catalog()
-      const readerRevision = this.state.readerRevision
-      const writer =
-        parentId.kind === 'some' ? this.writerCatalog(parentId.value, before) : cloneCatalog(reader)
-      const incremental =
-        parentId.kind === 'some' &&
-        this.state.validatedCommits.get(parentId.value) === readerRevision
-      if (parentId.kind === 'some' && !incremental) {
-        const drift = checkDrift(before, writer, reader, parentId.value)
-        if (
-          drift.backfillableNodes.length ||
-          drift.compatibleChanges.length ||
-          drift.promotedCustomFields.length ||
-          drift.incompatibilities.length
-        ) {
-          throw new SchemaFailure({
-            kind: 'schema_drift_requires_sync',
-            commitId: parentId.value,
-            reason: 'Active Reader Schema differs from Writer Schema; call syncSchema first',
-          })
-        }
-      }
-      const catalog = effectiveCatalog(reader, writer, true)
-      const draft = new DraftOverlay(before)
-      if (parentId.kind === 'none') {
-        writeCatalog(draft, reader)
-        for (const root of reader.roots.values())
-          materializeDefaultNode(draft, root.path, root.schema)
-      }
-      const tx = new Transaction(draft, catalog, reader, commitId, writer)
-      try {
-        const result = mutate?.(tx.asTransaction())
-        if (result && typeof result === 'object' && 'then' in result)
-          throw new TypeError('Schema transactions must be synchronous')
-        if (result && !result.ok) throw new SchemaFailure(result.error)
-      } finally {
-        tx.finish()
-      }
-      let message: Value
-      if (typeof options.message === 'string') message = options.message
-      else {
-        const schema = reader.messages.get(options.message.kind)
-        if (!schema)
-          throw new SchemaFailure({
-            kind: 'validation_failed',
-            path: [],
-            reason: 'type_mismatch',
-            detail: 'Message kind is not registered',
-          })
-        message = encodeMessage(options.message, schema)
-      }
-      return this.finish(
-        draft,
-        catalog,
-        reader,
-        parentId,
-        message,
-        readerRevision,
-        incremental ? 'incremental' : 'full',
-        options.head,
-      )
-    })
+    return this.write(() => this.committer.commit(this.ctx, options, mutate))
   }
   /**
    * Compare the commit's stored Writer catalog with active Reader definitions
@@ -770,10 +304,7 @@ export class SchemaService extends Service {
    * @see SchemaDriftReport
    */
   checkDrift(commitId: CommitHash): Result<SchemaDriftReport, SchemaError> {
-    return attempt(() => {
-      const source = new WorldStateReader(this.ctx.world, commitId)
-      return checkDrift(source, this.writerCatalog(commitId, source), this.catalog(), commitId)
-    })
+    return attempt(() => this.history.drift(this.ctx, commitId))
   }
   /**
    * Synchronize the current tip of an existing head to the active Reader schema.
@@ -794,29 +325,6 @@ export class SchemaService extends Service {
    * @see CommitValidatorFn
    */
   syncSchema(options: SyncSchemaOptions): Result<CommitNode, SchemaError> {
-    return this.write(() => {
-      const name = typeof options.head === 'string' ? options.head : options.head.name
-      const parentId = this.ctx.world.getHead(name)
-      if (parentId.kind === 'none')
-        throw new SchemaFailure({
-          kind: 'world_error',
-          error: { kind: 'head_not_found', headName: name },
-        })
-      const before = new WorldStateReader(this.ctx.world, parentId.value)
-      const writer = this.writerCatalog(parentId.value, before),
-        reader = this.catalog()
-      const readerRevision = this.state.readerRevision
-      const migrated = migrateState(before, writer, reader, parentId.value, options)
-      return this.finish(
-        migrated.draft,
-        migrated.catalog,
-        reader,
-        parentId,
-        'syncSchema',
-        readerRevision,
-        'full',
-        options.head,
-      )
-    })
+    return this.write(() => this.committer.sync(this.ctx, options))
   }
 }

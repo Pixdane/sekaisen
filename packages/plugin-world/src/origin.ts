@@ -71,6 +71,11 @@ export class PatchError extends Error {
   }
 }
 
+/** Throw a {@link WorldError} as the internal {@link PatchError} carrier. */
+export function fail(error: WorldError): never {
+  throw new PatchError(error)
+}
+
 /**
  * Apply a canonical two-phase `diff` (`del` phase followed by `set`/`ref` phase)
  * onto `base`, returning a new structurally shared {@link OriginDirectoryNode}

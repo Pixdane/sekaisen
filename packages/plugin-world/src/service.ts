@@ -1,32 +1,24 @@
 import type { Option, Result } from '@sekaisen/core'
-import { compareUtf8, err, InvariantError, NONE, ok, some } from '@sekaisen/core'
+import { err, InvariantError, NONE, ok, some } from '@sekaisen/core'
 import type { Context } from 'cordis'
 import { Service } from 'cordis'
 import {
-  applyRemapPolicy,
   cloneDiff,
-  cloneEntry,
-  cloneRef,
   cloneValue,
-  comparePaths,
-  encodePathKey,
   hashCommit,
-  leafEntryEquals,
   materializeSelfRefs,
   SELF_COMMIT,
   validatePath,
 } from './codec.ts'
-import { applyIndex, emptyIndex, isPrefix, locate, PatchError } from './origin.ts'
+import { applyIndex, emptyIndex, fail, locate, PatchError } from './origin.ts'
+import { WorldTreeReader } from './reader.ts'
+import { rebaseOnto } from './rebase.ts'
 import { WorldStorage } from './storage.ts'
 import type {
   CommitHash,
   CommitInput,
   CommitNode,
-  DiffOp,
-  LeafEntry,
-  OriginTreeNode,
   Path,
-  PathConflictDetail,
   RebaseOptions,
   RebaseOutcome,
   StateRef,
@@ -47,39 +39,6 @@ declare module 'cordis' {
   }
 }
 
-function fail(error: WorldError): never {
-  throw new PatchError(error)
-}
-
-function sameOption(a: Option<CommitHash>, b: Option<CommitHash>): boolean {
-  return a.kind === 'none' ? b.kind === 'none' : b.kind === 'some' && a.value === b.value
-}
-
-function viewsEqual(a: Option<TreeNodeView>, b: Option<TreeNodeView>): boolean {
-  if (a.kind === 'none' || b.kind === 'none') return a.kind === b.kind
-  const stack: [TreeNodeView, TreeNodeView][] = [[a.value, b.value]]
-  while (stack.length > 0) {
-    const [left, right] = stack.pop()!
-    if (left.nodeKind !== right.nodeKind) return false
-    if (left.nodeKind === 'leaf' && right.nodeKind === 'leaf') {
-      if (!leafEntryEquals(left.entry, right.entry)) return false
-      continue
-    }
-    if (
-      left.nodeKind !== 'dir' ||
-      right.nodeKind !== 'dir' ||
-      left.entries.size !== right.entries.size
-    )
-      return false
-    for (const [name, child] of left.entries) {
-      const other = right.entries.get(name)
-      if (!other) return false
-      stack.push([child, other])
-    }
-  }
-  return true
-}
-
 /**
  * Cordis service implementing the content-addressed world state commit forest.
  *
@@ -95,6 +54,7 @@ function viewsEqual(a: Option<TreeNodeView>, b: Option<TreeNodeView>): boolean {
  */
 export class WorldService extends Service<WorldConfig> {
   private readonly storage: WorldStorage
+  private readonly reader: WorldTreeReader
   private inWriteOperation: boolean
   readonly config: WorldConfig
 
@@ -103,6 +63,7 @@ export class WorldService extends Service<WorldConfig> {
     super(ctx, 'world')
     this.config = config
     this.storage = storage
+    this.reader = new WorldTreeReader(storage)
     this.inWriteOperation = false
     this.ctx.effect(() => () => {
       if (config.closeOnDispose === true) config.driver.close()
@@ -135,12 +96,6 @@ export class WorldService extends Service<WorldConfig> {
     }
   }
 
-  private requireCommit(id: CommitHash) {
-    const record = this.storage.commits.get(id)
-    if (!record) fail({ kind: 'commit_not_found', commitId: id })
-    return record
-  }
-
   private checkPath(path: Path): void {
     try {
       validatePath(path)
@@ -161,8 +116,11 @@ export class WorldService extends Service<WorldConfig> {
   private checkCas(name: string, expected: Option<CommitHash> | undefined): void {
     if (expected !== undefined) {
       const actual = this.getHead(name)
-      if (!sameOption(actual, expected))
-        fail({ kind: 'head_cas_mismatch', headName: name, expected, actual })
+      const matches =
+        actual.kind === 'none'
+          ? expected.kind === 'none'
+          : expected.kind === 'some' && actual.value === expected.value
+      if (!matches) fail({ kind: 'head_cas_mismatch', headName: name, expected, actual })
     }
   }
 
@@ -208,12 +166,12 @@ export class WorldService extends Service<WorldConfig> {
 
   /** Return the parent commit hash of `id` (`NONE` when `id` is a root). */
   getParent(id: CommitHash): Result<Option<CommitHash>, WorldError> {
-    return this.attempt(() => this.requireCommit(id).parentId)
+    return this.attempt(() => this.reader.requireCommit(id).parentId)
   }
 
   /** Return all direct child commit hashes of `id`. */
   getChildren(id: CommitHash): Result<readonly CommitHash[], WorldError> {
-    return this.attempt(() => Object.freeze([...this.requireCommit(id).children]))
+    return this.attempt(() => Object.freeze([...this.reader.requireCommit(id).children]))
   }
 
   /**
@@ -224,7 +182,7 @@ export class WorldService extends Service<WorldConfig> {
    */
   getReferencingCommits(id: CommitHash): Result<readonly CommitHash[], WorldError> {
     return this.attempt(() => {
-      this.requireCommit(id)
+      this.reader.requireCommit(id)
       return Object.freeze([...(this.storage.pins.get(id) ?? [])])
     })
   }
@@ -254,11 +212,12 @@ export class WorldService extends Service<WorldConfig> {
   setHead(name: string, id: CommitHash, expected?: Option<CommitHash>): Result<void, WorldError> {
     return this.write(() => {
       this.checkName(name)
-      const target = this.requireCommit(id)
+      const target = this.reader.requireCommit(id)
       this.checkCas(name, expected)
       const previous = this.storage.heads.get(name)
       if (previous === id) return
-      const oldIndex = previous === undefined ? undefined : this.requireCommit(previous).index
+      const oldIndex =
+        previous === undefined ? undefined : this.reader.requireCommit(previous).index
       const hot = this.storage.driver.transaction(() => {
         this.storage.writeHead(name, id)
         return this.storage.prepareHot(oldIndex, target.index)
@@ -281,7 +240,7 @@ export class WorldService extends Service<WorldConfig> {
       this.checkCas(name, expected)
       const previous = this.storage.heads.get(name)
       if (previous === undefined) fail({ kind: 'head_not_found', headName: name })
-      const oldIndex = this.requireCommit(previous).index
+      const oldIndex = this.reader.requireCommit(previous).index
       const hot = this.storage.driver.transaction(() => {
         this.storage.driver
           .prepare('DELETE FROM heads WHERE name = CAST(? AS TEXT)')
@@ -292,90 +251,6 @@ export class WorldService extends Service<WorldConfig> {
       if (hot) this.storage.installHot(hot)
       this.emitHead(name, NONE)
     })
-  }
-
-  /**
-   * Clone one stored leaf and optionally project its `StateRef` while knowing
-   * which commit originally wrote the leaf. Rebase uses the origin to
-   * force-sync prior self references without letting a remap policy override it.
-   */
-  private leafEntryAt(
-    originCommitId: CommitHash,
-    pathKey: string,
-    transformRef?: (ref: StateRef, originCommitId: CommitHash) => StateRef,
-  ): LeafEntry {
-    const entry = cloneEntry(this.storage.entry(originCommitId, pathKey))
-    if (!transformRef || entry.entryKind !== 'ref') return entry
-    return Object.freeze({
-      entryKind: 'ref',
-      ref: cloneRef(transformRef(entry.ref, originCommitId)),
-    })
-  }
-
-  /**
-   * Materialize the subtree at `path` from commit `id`.
-   *
-   * `transformRef` is only used by rebase base views: it receives each ref leaf
-   * together with the commit that wrote it. Normal reads leave it undefined and
-   * return stored (already materialized) refs unchanged.
-   */
-  private view(
-    id: CommitHash,
-    path: Path,
-    transformRef?: (ref: StateRef, originCommitId: CommitHash) => StateRef,
-  ): Option<TreeNodeView> {
-    const index = locate(this.requireCommit(id).index, path)
-    if (!index) return NONE
-    const rootKey = encodePathKey(path)
-    if (index.kind === 'leaf') {
-      return some(
-        Object.freeze({
-          nodeKind: 'leaf',
-          entry: this.leafEntryAt(index.originCommitId, rootKey, transformRef),
-        }),
-      )
-    }
-    const rootEntries = new Map<string, TreeNodeView>()
-    const stack: {
-      readonly node: OriginTreeNode & { readonly kind: 'dir' }
-      readonly atKey: string
-      readonly entries: Map<string, TreeNodeView>
-    }[] = [{ node: index, atKey: rootKey, entries: rootEntries }]
-    const postOrder: {
-      readonly entries: Map<string, TreeNodeView>
-      readonly parent?: Map<string, TreeNodeView>
-      readonly key?: string
-    }[] = [{ entries: rootEntries }]
-
-    while (stack.length > 0) {
-      const current = stack.pop()!
-      const sorted = [...current.node.children].sort(([a], [b]) => comparePaths([a], [b]))
-      for (const [name] of sorted) current.entries.set(name, null as unknown as TreeNodeView)
-      for (let i = sorted.length - 1; i >= 0; i--) {
-        const [name, child] = sorted[i]!
-        const childKey = `${current.atKey}${encodePathKey([name])}`
-        if (child.kind === 'leaf') {
-          current.entries.set(
-            name,
-            Object.freeze({
-              nodeKind: 'leaf',
-              entry: this.leafEntryAt(child.originCommitId, childKey, transformRef),
-            }),
-          )
-        } else {
-          const childEntries = new Map<string, TreeNodeView>()
-          postOrder.push({ entries: childEntries, parent: current.entries, key: name })
-          stack.push({ node: child, atKey: childKey, entries: childEntries })
-        }
-      }
-    }
-    for (let i = postOrder.length - 1; i >= 0; i--) {
-      const item = postOrder[i]!
-      const dir: TreeNodeView = Object.freeze({ nodeKind: 'dir', entries: item.entries })
-      if (item.parent && item.key !== undefined) item.parent.set(item.key, dir)
-      else return some(dir)
-    }
-    return NONE
   }
 
   /**
@@ -393,15 +268,7 @@ export class WorldService extends Service<WorldConfig> {
   getNodeInfo(id: CommitHash, path: Path = []): Result<Option<TreeNodeInfo>, WorldError> {
     return this.attempt(() => {
       this.checkPath(path)
-      const node = locate(this.requireCommit(id).index, path)
-      if (!node) return NONE
-      return some(
-        Object.freeze(
-          node.kind === 'leaf'
-            ? { nodeKind: 'leaf' as const, originCommitId: node.originCommitId }
-            : { nodeKind: 'dir' as const, lastModifiedAt: node.lastModifiedAt },
-        ),
-      )
+      return this.reader.nodeInfo(id, path)
     })
   }
 
@@ -420,11 +287,7 @@ export class WorldService extends Service<WorldConfig> {
   listChildren(id: CommitHash, path: Path = []): Result<Option<readonly string[]>, WorldError> {
     return this.attempt(() => {
       this.checkPath(path)
-      const node = locate(this.requireCommit(id).index, path)
-      if (!node) return NONE
-      if (node.kind !== 'dir')
-        fail({ kind: 'structure_conflict', path, reason: 'Cannot list children of a leaf' })
-      return some(Object.freeze([...node.children.keys()].sort(compareUtf8)))
+      return this.reader.children(id, path)
     })
   }
 
@@ -437,7 +300,7 @@ export class WorldService extends Service<WorldConfig> {
   getNode(id: CommitHash, path: Path = []): Result<Option<TreeNodeView>, WorldError> {
     return this.attempt(() => {
       this.checkPath(path)
-      return this.view(id, path)
+      return this.reader.view(id, path)
     })
   }
 
@@ -445,10 +308,7 @@ export class WorldService extends Service<WorldConfig> {
   getValue(id: CommitHash, path: Path): Result<Option<Value>, WorldError> {
     return this.attempt(() => {
       this.checkPath(path)
-      const node = locate(this.requireCommit(id).index, path)
-      if (node?.kind !== 'leaf') return NONE
-      const entry = this.storage.entry(node.originCommitId, encodePathKey(path))
-      return entry.entryKind === 'val' ? some(cloneValue(entry.value)) : NONE
+      return this.reader.value(id, path)
     })
   }
 
@@ -456,46 +316,25 @@ export class WorldService extends Service<WorldConfig> {
   getRef(id: CommitHash, path: Path): Result<Option<StateRef>, WorldError> {
     return this.attempt(() => {
       this.checkPath(path)
-      const node = locate(this.requireCommit(id).index, path)
-      if (node?.kind !== 'leaf') return NONE
-      const entry = this.storage.entry(node.originCommitId, encodePathKey(path))
-      return entry.entryKind === 'ref' ? some(cloneRef(entry.ref)) : NONE
+      return this.reader.ref(id, path)
     })
   }
 
   /** Read the `message` value attached to commit `id`. */
   getMessage(id: CommitHash): Result<Value, WorldError> {
-    return this.attempt(() => {
-      this.requireCommit(id)
-      return cloneValue(this.storage.message(id))
-    })
+    return this.attempt(() => this.reader.message(id))
   }
 
   /** Dereference `ref`, returning the `TreeNodeView` at `(ref.commitId, ref.path)`. */
   deref(ref: StateRef): Result<Option<TreeNodeView>, WorldError> {
-    return this.attempt(() => {
-      let copy: StateRef
-      try {
-        copy = cloneRef(ref)
-      } catch (cause) {
-        fail({ kind: 'invalid_path', path: ref.path, reason: String(cause) })
-      }
-      return this.view(copy.commitId, copy.path)
-    })
+    return this.attempt(() => this.reader.deref(ref))
   }
 
   /** Return `true` if the content at `(ref.commitId, ref.path)` differs from `(compareId, ref.path)`. */
   isRefChanged(ref: StateRef, compareId: CommitHash): Result<boolean, WorldError> {
     return this.attempt(() => {
       this.checkPath(ref.path)
-      const a = locate(this.requireCommit(ref.commitId).index, ref.path)
-      const b = locate(this.requireCommit(compareId).index, ref.path)
-      if (a === b) return false
-      if (a?.kind === 'leaf' && b?.kind === 'leaf' && a.originCommitId === b.originCommitId)
-        return false
-      if (a?.kind === 'dir' && b?.kind === 'dir' && a.lastModifiedAt === b.lastModifiedAt)
-        return false
-      return !viewsEqual(this.view(ref.commitId, ref.path), this.view(compareId, ref.path))
+      return this.reader.isRefChanged(ref, compareId)
     })
   }
 
@@ -516,7 +355,7 @@ export class WorldService extends Service<WorldConfig> {
     return this.write(() => this.commitInternal(input))
   }
   private commitInternal(input: CommitInput): CommitNode {
-    if (input.parentId.kind === 'some') this.requireCommit(input.parentId.value)
+    if (input.parentId.kind === 'some') this.reader.requireCommit(input.parentId.value)
     const advance =
       typeof input.advanceHead === 'string' ? { name: input.advanceHead } : input.advanceHead
     let previousHead: CommitHash | undefined
@@ -548,7 +387,7 @@ export class WorldService extends Service<WorldConfig> {
     const index =
       existing?.index ??
       applyIndex(
-        parentId.kind === 'some' ? this.requireCommit(parentId.value).index : emptyIndex(id),
+        parentId.kind === 'some' ? this.reader.requireCommit(parentId.value).index : emptyIndex(id),
         diff,
         id,
       )
@@ -566,7 +405,7 @@ export class WorldService extends Service<WorldConfig> {
       if (headChanged && advance) this.storage.writeHead(advance.name, id)
       return headChanged
         ? this.storage.prepareHot(
-            previousHead === undefined ? undefined : this.requireCommit(previousHead).index,
+            previousHead === undefined ? undefined : this.reader.requireCommit(previousHead).index,
             index,
           )
         : undefined
@@ -598,7 +437,7 @@ export class WorldService extends Service<WorldConfig> {
    */
   popLeaf(id: CommitHash): Result<void, WorldError> {
     return this.write(() => {
-      const record = this.requireCommit(id)
+      const record = this.reader.requireCommit(id)
       const referencedByCommits = Object.freeze([...(this.storage.pins.get(id) ?? [])])
       const pointedByHeads = Object.freeze(
         [...this.storage.heads].filter(([, target]) => target === id).map(([name]) => name),
@@ -649,250 +488,20 @@ export class WorldService extends Service<WorldConfig> {
     ontoId: CommitHash,
     options: RebaseOptions = {},
   ): Result<RebaseOutcome, WorldError> {
-    return this.write(() => {
-      const sourceIds = Object.freeze([...sourceChainIds])
-      this.requireCommit(ontoId)
-      for (let i = 0; i < sourceIds.length; i++) {
-        const source = this.requireCommit(sourceIds[i]!)
-        if (
-          i > 0 &&
-          (source.parentId.kind === 'none' || source.parentId.value !== sourceIds[i - 1])
-        ) {
-          fail({ kind: 'structure_conflict', path: [], reason: 'source_chain_is_not_contiguous' })
-        }
-      }
-      const remapped = new Map(options.initialRemap)
-      const policy = options.remapRefs ?? 'none'
-      let tip = ontoId
-      for (let i = 0; i < sourceIds.length; i++) {
-        const sourceId = sourceIds[i]!
-        const source = this.requireCommit(sourceId)
-        const transform = (ref: StateRef): StateRef => {
-          let mapped: StateRef
-          try {
-            mapped = cloneRef(applyRemapPolicy(ref, policy, new Map(remapped)))
-          } catch (cause) {
-            if (cause instanceof InvariantError) throw cause
-            fail({ kind: 'invalid_value', path: ref.path, reason: String(cause) })
-          }
-          if (!this.hasCommit(mapped.commitId))
-            fail({ kind: 'dangling_ref', refCommitId: mapped.commitId, refPath: mapped.path })
-          return mapped
-        }
-        const forceSelfSync = (ref: StateRef, originCommitId: CommitHash): StateRef => {
-          if (ref.commitId === originCommitId) {
-            const replacement = remapped.get(originCommitId)
-            if (replacement !== undefined) {
-              if (!this.hasCommit(replacement))
-                fail({ kind: 'dangling_ref', refCommitId: replacement, refPath: ref.path })
-              return cloneRef({ commitId: replacement, path: ref.path })
-            }
-          }
-          return transform(ref)
-        }
-        const effective = cloneDiff(
-          this.storage.diff(sourceId).map((op) => {
-            if (op.op !== 'ref') return op
-            if (op.ref.commitId === sourceId)
-              return {
-                op: 'ref' as const,
-                path: op.path,
-                ref: { commitId: SELF_COMMIT, path: op.ref.path },
-              }
-            return { ...op, ref: transform(op.ref) }
-          }),
-        )
-        const groups: { root: Path; ops: DiffOp[] }[] = []
-        for (const op of effective) {
-          const group = groups.at(-1)
-          if (group && isPrefix(group.root, op.path)) group.ops.push(op)
-          else groups.push({ root: op.path, ops: [op] })
-        }
-        const conflicts: PathConflictDetail[] = []
-        const reportedAncestors = new Set<string>()
-        const retained: DiffOp[] = []
-        for (const group of groups) {
-          const base =
-            source.parentId.kind === 'some'
-              ? this.view(source.parentId.value, group.root, forceSelfSync)
-              : NONE
-          const desired = this.desiredView(base, group.root, group.ops)
-          const target = this.view(tip, group.root)
-          let ancestorConflict = false
-          let targetCursor: OriginTreeNode | undefined = this.requireCommit(tip).index
-          let baseCursor: OriginTreeNode | undefined =
-            source.parentId.kind === 'some'
-              ? this.requireCommit(source.parentId.value).index
-              : undefined
-          let ancestorKey = ''
-          for (let depth = 1; depth < group.root.length; depth++) {
-            const seg = group.root[depth - 1]!
-            ancestorKey += encodePathKey([seg])
-            if (reportedAncestors.has(ancestorKey)) {
-              ancestorConflict = true
-              break
-            }
-            targetCursor = targetCursor?.kind === 'dir' ? targetCursor.children.get(seg) : undefined
-            baseCursor = baseCursor?.kind === 'dir' ? baseCursor.children.get(seg) : undefined
-            const reason =
-              targetCursor?.kind === 'leaf'
-                ? 'structure_conflict'
-                : desired.kind === 'some' && baseCursor?.kind === 'dir' && !targetCursor
-                  ? 'target_deleted_subtree'
-                  : undefined
-            if (reason) {
-              const ancestorPath = Object.freeze(group.root.slice(0, depth))
-              const targetAncestor = this.view(tip, ancestorPath)
-              const baseAncestor =
-                source.parentId.kind === 'some'
-                  ? this.view(source.parentId.value, ancestorPath, forceSelfSync)
-                  : NONE
-              const incomingAncestor = this.desiredView(
-                baseAncestor,
-                ancestorPath,
-                effective.filter((op) => isPrefix(ancestorPath, op.path)),
-              )
-              conflicts.push(
-                Object.freeze({
-                  path: ancestorPath,
-                  reason,
-                  baseNode: baseAncestor,
-                  targetNode: targetAncestor,
-                  incomingNode: incomingAncestor,
-                }),
-              )
-              reportedAncestors.add(ancestorKey)
-              ancestorConflict = true
-              break
-            }
-          }
-          if (ancestorConflict) continue
-          // Desired SELF_COMMIT leaves never byte-equal a materialized target
-          // ref, so a self write cannot be pruned as a same-change no-op here.
-          if (viewsEqual(target, desired)) continue
-          if (viewsEqual(target, base)) {
-            retained.push(...group.ops)
-            continue
-          }
-          const reason =
-            desired.kind === 'none'
-              ? 'source_deleted_modified_subtree'
-              : target.kind === 'none' && base.kind === 'some'
-                ? 'target_deleted_subtree'
-                : target.kind === 'some' &&
-                    desired.kind === 'some' &&
-                    target.value.nodeKind !== desired.value.nodeKind
-                  ? 'structure_conflict'
-                  : 'value_diverged'
-          conflicts.push(
-            Object.freeze({
-              path: group.root,
-              reason,
-              baseNode: base,
-              targetNode: target,
-              incomingNode: desired,
-            }),
-          )
-        }
-        if (conflicts.length)
-          return Object.freeze({
-            status: 'conflict',
-            currentTipId: tip,
-            conflictedSourceId: sourceId,
-            remainingSourceIds: Object.freeze(sourceIds.slice(i)),
-            remappedIds: new Map(remapped),
-            conflicts: Object.freeze(conflicts),
-          })
-        const result = this.attempt(() =>
-          this.commitInternal({
-            parentId: some(tip),
-            message: this.storage.message(sourceId),
-            diff: retained,
-          }),
-        )
-        if (!result.ok) {
-          if (result.error.kind === 'storage_error')
-            fail({
-              ...result.error,
-              partialRebase: { currentTipId: tip, completedRemap: new Map(remapped) },
-            })
-          fail(result.error)
-        }
-        remapped.set(sourceId, result.value.id)
-        tip = result.value.id
-      }
-      return Object.freeze({ status: 'completed', newTipId: tip, remappedIds: new Map(remapped) })
-    })
-  }
-
-  private desiredView(
-    base: Option<TreeNodeView>,
-    root: Path,
-    ops: readonly DiffOp[],
-  ): Option<TreeNodeView> {
-    const leaves = new Map<string, { path: Path; entry: LeafEntry }>()
-    if (base.kind === 'some') {
-      const collectStack: { node: TreeNodeView; path: Path }[] = [{ node: base.value, path: root }]
-      while (collectStack.length > 0) {
-        const { node, path } = collectStack.pop()!
-        if (node.nodeKind === 'leaf') leaves.set(encodePathKey(path), { path, entry: node.entry })
-        else {
-          for (const [name, child] of node.entries) {
-            collectStack.push({ node: child, path: [...path, name] })
-          }
-        }
-      }
-    }
-    for (const op of ops)
-      if (op.op === 'del') {
-        for (const [key, leaf] of leaves) if (isPrefix(op.path, leaf.path)) leaves.delete(key)
-      }
-    for (const op of ops)
-      if (op.op !== 'del')
-        leaves.set(encodePathKey(op.path), {
-          path: op.path,
-          entry:
-            op.op === 'set'
-              ? { entryKind: 'val', value: cloneValue(op.value) }
-              : { entryKind: 'ref', ref: cloneRef(op.ref) },
-        })
-    if (!leaves.size) return NONE
-    const rootLeaf = leaves.get(encodePathKey(root))
-    if (rootLeaf)
-      return some(Object.freeze({ nodeKind: 'leaf', entry: cloneEntry(rootLeaf.entry) }))
-
-    interface DirBuilder {
-      readonly entries: Map<string, TreeNodeView>
-      readonly children: Map<string, DirBuilder>
-    }
-    const rootBuilder: DirBuilder = { entries: new Map(), children: new Map() }
-    const allBuilders: DirBuilder[] = [rootBuilder]
-    const sortedLeaves = [...leaves.values()].sort((a, b) => comparePaths(a.path, b.path))
-    for (const leaf of sortedLeaves) {
-      let cursor = rootBuilder
-      for (let d = root.length; d < leaf.path.length - 1; d++) {
-        const seg = leaf.path[d]!
-        let child = cursor.children.get(seg)
-        if (!child) {
-          child = { entries: new Map(), children: new Map() }
-          cursor.children.set(seg, child)
-          cursor.entries.set(seg, null as unknown as TreeNodeView)
-          allBuilders.push(child)
-        }
-        cursor = child
-      }
-      const lastSeg = leaf.path[leaf.path.length - 1]!
-      cursor.entries.set(
-        lastSeg,
-        Object.freeze({ nodeKind: 'leaf', entry: cloneEntry(leaf.entry) }),
-      )
-    }
-    for (let i = allBuilders.length - 1; i >= 0; i--) {
-      const builder = allBuilders[i]!
-      for (const [seg, childBuilder] of builder.children) {
-        builder.entries.set(seg, Object.freeze({ nodeKind: 'dir', entries: childBuilder.entries }))
-      }
-    }
-    return some(Object.freeze({ nodeKind: 'dir', entries: rootBuilder.entries }))
+    return this.write(() =>
+      rebaseOnto(
+        {
+          requireCommit: (id) => this.reader.requireCommit(id),
+          hasCommit: (id) => this.storage.commits.has(id),
+          view: (id, path, transformRef) => this.reader.view(id, path, transformRef),
+          message: (id) => this.storage.message(id),
+          diff: (id) => this.storage.diff(id),
+          commit: (input) => this.attempt(() => this.commitInternal(input())),
+        },
+        sourceChainIds,
+        ontoId,
+        options,
+      ),
+    )
   }
 }
