@@ -1,18 +1,20 @@
 import type { Option, Result } from '@sekaisen/core'
-import { InvariantError, NONE } from '@sekaisen/core'
+import { InvariantError, isOption, NONE, some } from '@sekaisen/core'
 import type {
   AdvanceHeadInput,
   CommitHash,
   CommitNode,
   Path,
   StateDiff,
+  StateRef,
   Value,
 } from '@sekaisen/plugin-world'
 import { encodePathKey } from '@sekaisen/plugin-world'
 import type { Context } from 'cordis'
 import { Service } from 'cordis'
-import { assertIdentifier, cloneSchema, SchemaFailure } from './builders.ts'
+import { assertIdentifier, cloneSchema, cloneStateRef, SchemaFailure } from './builders.ts'
 import { checkDrift, migrateState } from './evolution.ts'
+import { validateLinkRegistration, validateStateLinks } from './links.ts'
 import { decodeMessage, encodeMessage, makeMessagePrism } from './message.ts'
 import { getLensRoot, getLensRoute, makeLens } from './optics.ts'
 import { DraftOverlay } from './overlay.ts'
@@ -48,6 +50,7 @@ import type {
   MessagePrism,
   MessageStructSchemaNode,
   ReadonlySchemaView,
+  ResolvedStateRefValue,
   SchemaCommitOptions,
   SchemaDriftReport,
   SchemaError,
@@ -236,6 +239,7 @@ export class SchemaService extends Service {
           })
       }
       const schema = cloneSchema(node)
+      validateLinkRegistration(schema, path)
       const id = Symbol()
       const ownedPath = Object.freeze([...path])
       this.ctx.effect(() => {
@@ -300,6 +304,9 @@ export class SchemaService extends Service {
             reason: 'field_name_collision',
           })
         fields[key] = cloneSchema(node)
+        // Augmented fields are attached to an existing Struct instance, so a
+        // direct or Map-nested link here has a valid source boundary.
+        validateLinkRegistration(fields[key]!, [...path, key], true)
         check(fields[key]!, [...path, key])
       }
       const id = Symbol()
@@ -509,6 +516,63 @@ export class SchemaService extends Service {
   ): Result<Option<InferCoreOutput<S>>, SchemaError> {
     return attempt(() => unwrap(prism.parse(unwrap(this.getMessage(commitId)))))
   }
+  /**
+   * Resolve an arbitrary state reference.
+   *
+   * `$message` refs decode the commit message through its stored Writer schema
+   * and walk the remaining segments through the payload. `Option` wrappers are
+   * transparently unwrapped at every step, so refs can address nested optional
+   * fields directly; a missing segment yields `ok(... value: NONE)` rather than
+   * an error. All other refs delegate to {@link inspectInstance}, which is
+   * Writer-faithful and therefore unaffected by later mutation or deletion.
+   *
+   * @param ref Caller-supplied reference; copied before use.
+   * @returns `state_node` or `commit_message` discriminated result.
+   * @remarks Invalid refs and unreadable commits return structured failures.
+   */
+  resolveRef(ref: StateRef): Result<ResolvedStateRefValue, SchemaError> {
+    return attempt(() => {
+      const checked = cloneStateRef(ref)
+      if (checked.path[0] !== '$message')
+        return Object.freeze({
+          targetKind: 'state_node' as const,
+          inspection: unwrap(this.inspectInstance(checked.commitId, checked.path)),
+        })
+      const message = unwrap(this.getMessage(checked.commitId))
+      let current: unknown = message.data
+      for (const segment of checked.path.slice(1)) {
+        if (isOption(current)) current = current.kind === 'none' ? undefined : current.value
+        if (
+          current === null ||
+          typeof current !== 'object' ||
+          Array.isArray(current) ||
+          current instanceof Uint8Array
+        )
+          return Object.freeze({
+            targetKind: 'commit_message' as const,
+            messageKind: message.kind,
+            value: NONE as Option<unknown>,
+          })
+        if (!Object.hasOwn(current, segment))
+          return Object.freeze({
+            targetKind: 'commit_message' as const,
+            messageKind: message.kind,
+            value: NONE as Option<unknown>,
+          })
+        current = (current as Record<string, unknown>)[segment]
+      }
+      const value: Option<unknown> = isOption(current)
+        ? current
+        : current === undefined
+          ? NONE
+          : some(current)
+      return Object.freeze({
+        targetKind: 'commit_message' as const,
+        messageKind: message.kind,
+        value,
+      })
+    })
+  }
   private write<T>(fn: () => T): Result<T, SchemaError> {
     if (this.state.busy) throw new InvariantError('Reentrant schema write operation')
     this.state.busy = true
@@ -552,6 +616,9 @@ export class SchemaService extends Service {
       validateState(draft, catalog, commitId)
       diff = draft.compileDiff()
     }
+    // Link semantics are re-checked on the final state regardless of the write
+    // path that produced it (low-level draft writes, migrations, cascades).
+    validateStateLinks(draft, catalog)
     const view = new ReadView(draft, catalog, reader, commitId).readonlyView()
     for (const validator of [...this.state.validators]) {
       const exposedDiff: StateDiff = Object.freeze(
@@ -661,7 +728,7 @@ export class SchemaService extends Service {
         for (const root of reader.roots.values())
           materializeDefaultNode(draft, root.path, root.schema)
       }
-      const tx = new Transaction(draft, catalog, reader, commitId)
+      const tx = new Transaction(draft, catalog, reader, commitId, writer)
       try {
         const result = mutate?.(tx.asTransaction())
         if (result && typeof result === 'object' && 'then' in result)

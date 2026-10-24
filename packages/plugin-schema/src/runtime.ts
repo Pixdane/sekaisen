@@ -32,6 +32,12 @@ export interface StateReader {
   hasEntry(path: Path): boolean
   /** Direct child keys in World UTF-8 order; absent paths and leaves yield `[]`. */
   childKeys(path: Path): readonly string[]
+  /**
+   * Monotonic write counter for mutable drafts. Immutable readers (World
+   * commits, `EMPTY_STATE`) omit it, which lets derived indices cache once per
+   * snapshot and rebuild exactly after each draft write.
+   */
+  readonly revision?: number
 }
 /**
  * Mutable physical draft. Writes own their entry/path inputs and subtree deletes
@@ -48,6 +54,12 @@ export interface StateWriter extends StateReader {
    * `[]` clears the whole draft; later writes recreate only explicit coordinates.
    */
   deleteTree(path: Path): void
+  /** Open an undo scope for a compound operation that must be all-or-nothing. */
+  beginScope(): void
+  /** Accept the newest undo scope (merging into an enclosing scope when nested). */
+  commitScope(): void
+  /** Undo every write since the newest scope and close it. */
+  rollbackScope(): void
 }
 
 const EMPTY_KEYS: readonly string[] = Object.freeze([])
@@ -640,7 +652,10 @@ export function validateNodeHeader(
       const allowed =
         writer.nodeKind === 'leaf'
           ? key === '$val' || key === '$meta' || (key === '$spec' && path.at(-2) === '$custom')
-          : key === '$exists' || key === '$custom' || Object.hasOwn(writer.fields, key)
+          : key === '$exists' ||
+            key === '$custom' ||
+            key === '$meta' ||
+            Object.hasOwn(writer.fields, key)
       if (!allowed) corrupt(commitId, [...path, key], 'Field is not declared in Writer Schema')
     }
   }
@@ -730,9 +745,15 @@ export function inspectNode(
         ),
       ),
       customFields: Object.freeze(customFields),
+      meta: readMeta(state, path),
     }),
   )
 }
+/**
+ * Inspect declared Writer nodes or canonical custom leaf paths without
+ * inventing defaults. Custom refs retain the physical `$custom` segment so
+ * they resolve to the same node that World validates and anchors in history.
+ */
 export function inspectAt(
   state: StateReader,
   writer: Catalog,
@@ -748,6 +769,16 @@ export function inspectAt(
     for (const key of path.slice(root.path.length)) {
       if (resolvePresence(state, at, spec, spec, commitId) === 'absent') return NONE
       if (spec.nodeKind === 'struct') {
+        if (key === '$custom' && spec.allowCustom) {
+          const remaining = path.slice(at.length)
+          if (remaining.length !== 2) return NONE
+          const customKey = remaining[1]!
+          assertIdentifier(customKey)
+          const customPath = [...at, '$custom', customKey]
+          if (state.childKeys(customPath).length === 0) return NONE
+          const customSpec = readCustomSpec(state, customPath, commitId)
+          return inspectNode(state, customPath, customSpec, customSpec, commitId)
+        }
         const child: SchemaNode | undefined = spec.fields[key]
         if (!child) return NONE
         spec = child

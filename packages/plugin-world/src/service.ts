@@ -12,6 +12,8 @@ import {
   encodePathKey,
   hashCommit,
   leafEntryEquals,
+  materializeSelfRefs,
+  SELF_COMMIT,
   validatePath,
 } from './codec.ts'
 import { applyIndex, emptyIndex, isPrefix, locate, PatchError } from './origin.ts'
@@ -76,66 +78,6 @@ function viewsEqual(a: Option<TreeNodeView>, b: Option<TreeNodeView>): boolean {
     }
   }
   return true
-}
-
-function transformView(
-  view: Option<TreeNodeView>,
-  transform: (ref: StateRef) => StateRef,
-): Option<TreeNodeView> {
-  if (view.kind === 'none') return NONE
-  if (view.value.nodeKind === 'leaf') {
-    return some(
-      Object.freeze({
-        nodeKind: 'leaf',
-        entry:
-          view.value.entry.entryKind === 'ref'
-            ? Object.freeze({ entryKind: 'ref', ref: transform(view.value.entry.ref) })
-            : cloneEntry(view.value.entry),
-      }),
-    )
-  }
-  const rootEntries = new Map<string, TreeNodeView>()
-  const stack: {
-    readonly source: ReadonlyMap<string, TreeNodeView>
-    readonly target: Map<string, TreeNodeView>
-  }[] = [{ source: view.value.entries, target: rootEntries }]
-  const postOrder: {
-    readonly entries: Map<string, TreeNodeView>
-    readonly parent?: Map<string, TreeNodeView>
-    readonly key?: string
-  }[] = [{ entries: rootEntries }]
-
-  while (stack.length > 0) {
-    const current = stack.pop()!
-    const items = [...current.source]
-    for (const [key] of items) current.target.set(key, null as unknown as TreeNodeView)
-    for (let i = items.length - 1; i >= 0; i--) {
-      const [key, child] = items[i]!
-      if (child.nodeKind === 'leaf') {
-        current.target.set(
-          key,
-          Object.freeze({
-            nodeKind: 'leaf',
-            entry:
-              child.entry.entryKind === 'ref'
-                ? Object.freeze({ entryKind: 'ref', ref: transform(child.entry.ref) })
-                : cloneEntry(child.entry),
-          }),
-        )
-      } else {
-        const childEntries = new Map<string, TreeNodeView>()
-        postOrder.push({ entries: childEntries, parent: current.target, key })
-        stack.push({ source: child.entries, target: childEntries })
-      }
-    }
-  }
-  for (let i = postOrder.length - 1; i >= 0; i--) {
-    const item = postOrder[i]!
-    const dir: TreeNodeView = Object.freeze({ nodeKind: 'dir', entries: item.entries })
-    if (item.parent && item.key !== undefined) item.parent.set(item.key, dir)
-    else return some(dir)
-  }
-  return NONE
 }
 
 /**
@@ -274,7 +216,12 @@ export class WorldService extends Service<WorldConfig> {
     return this.attempt(() => Object.freeze([...this.requireCommit(id).children]))
   }
 
-  /** Return all live commit hashes that reference `id` via `StateRef`. */
+  /**
+   * Return all live commit hashes that reference `id` via `StateRef`.
+   *
+   * Self anchors (`ref.commitId === commit.id`) are not pin edges, so a commit
+   * never appears in its own referencing list.
+   */
   getReferencingCommits(id: CommitHash): Result<readonly CommitHash[], WorldError> {
     return this.attempt(() => {
       this.requireCommit(id)
@@ -347,7 +294,36 @@ export class WorldService extends Service<WorldConfig> {
     })
   }
 
-  private view(id: CommitHash, path: Path): Option<TreeNodeView> {
+  /**
+   * Clone one stored leaf and optionally project its `StateRef` while knowing
+   * which commit originally wrote the leaf. Rebase uses the origin to
+   * force-sync prior self references without letting a remap policy override it.
+   */
+  private leafEntryAt(
+    originCommitId: CommitHash,
+    pathKey: string,
+    transformRef?: (ref: StateRef, originCommitId: CommitHash) => StateRef,
+  ): LeafEntry {
+    const entry = cloneEntry(this.storage.entry(originCommitId, pathKey))
+    if (!transformRef || entry.entryKind !== 'ref') return entry
+    return Object.freeze({
+      entryKind: 'ref',
+      ref: cloneRef(transformRef(entry.ref, originCommitId)),
+    })
+  }
+
+  /**
+   * Materialize the subtree at `path` from commit `id`.
+   *
+   * `transformRef` is only used by rebase base views: it receives each ref leaf
+   * together with the commit that wrote it. Normal reads leave it undefined and
+   * return stored (already materialized) refs unchanged.
+   */
+  private view(
+    id: CommitHash,
+    path: Path,
+    transformRef?: (ref: StateRef, originCommitId: CommitHash) => StateRef,
+  ): Option<TreeNodeView> {
     const index = locate(this.requireCommit(id).index, path)
     if (!index) return NONE
     const rootKey = encodePathKey(path)
@@ -355,7 +331,7 @@ export class WorldService extends Service<WorldConfig> {
       return some(
         Object.freeze({
           nodeKind: 'leaf',
-          entry: cloneEntry(this.storage.entry(index.originCommitId, rootKey)),
+          entry: this.leafEntryAt(index.originCommitId, rootKey, transformRef),
         }),
       )
     }
@@ -383,7 +359,7 @@ export class WorldService extends Service<WorldConfig> {
             name,
             Object.freeze({
               nodeKind: 'leaf',
-              entry: cloneEntry(this.storage.entry(child.originCommitId, childKey)),
+              entry: this.leafEntryAt(child.originCommitId, childKey, transformRef),
             }),
           )
         } else {
@@ -528,6 +504,13 @@ export class WorldService extends Service<WorldConfig> {
    * Head residency updates use only the affected origin branches and are
    * published with topology before events. Replaying an existing canonical
    * commit reuses its stored index; it never creates a duplicate commit event.
+   *
+   * `diff` entries may use {@link SELF_COMMIT} to reference this very commit.
+   * They skip historical existence checks, are hashed as the literal `$self`
+   * and are materialized to the new id in storage and every returned view.
+   * A self target must exist in the final post-diff tree, be the empty path
+   * (whole tree), or start with the reserved `'$message'` prefix; otherwise
+   * the commit fails with `dangling_ref`.
    */
   commit(input: CommitInput): Result<CommitNode, WorldError> {
     return this.write(() => this.commitInternal(input))
@@ -551,13 +534,14 @@ export class WorldService extends Service<WorldConfig> {
     } catch (cause) {
       fail({ kind: 'invalid_value', path: [], reason: String(cause) })
     }
-    const diff = cloneDiff(input.diff ?? [])
-    for (const op of diff) {
-      if (op.op === 'ref' && !this.hasCommit(op.ref.commitId))
+    const canonicalDiff = cloneDiff(input.diff ?? [])
+    for (const op of canonicalDiff) {
+      if (op.op === 'ref' && op.ref.commitId !== SELF_COMMIT && !this.hasCommit(op.ref.commitId))
         fail({ kind: 'dangling_ref', refCommitId: op.ref.commitId, refPath: op.ref.path })
     }
     const parentId = input.parentId.kind === 'some' ? some(input.parentId.value) : NONE
-    const id = hashCommit(parentId, message, diff)
+    const id = hashCommit(parentId, message, canonicalDiff)
+    const diff = materializeSelfRefs(id, canonicalDiff)
     const existing = this.storage.commits.get(id)
     const isNew = existing === undefined
     // Preserve canonical object sharing when an existing hash is replayed.
@@ -568,6 +552,13 @@ export class WorldService extends Service<WorldConfig> {
         diff,
         id,
       )
+    for (const op of diff) {
+      if (op.op !== 'ref' || op.ref.commitId !== id) continue
+      const target = op.ref.path
+      if (target.length === 0 || target[0] === '$message') continue
+      if (!locate(index, target))
+        fail({ kind: 'dangling_ref', refCommitId: SELF_COMMIT, refPath: target })
+    }
     const node = Object.freeze({ id, parentId, message, diff })
     const headChanged = advance !== undefined && previousHead !== id
     const hot = this.storage.driver.transaction(() => {
@@ -580,14 +571,19 @@ export class WorldService extends Service<WorldConfig> {
           )
         : undefined
     })
-    if (isNew)
+    if (isNew) {
+      const references = new Set<CommitHash>()
+      for (const op of diff) {
+        if (op.op === 'ref' && op.ref.commitId !== id) references.add(op.ref.commitId)
+      }
       this.storage.add({
         id,
         parentId,
         index,
         children: new Set(),
-        references: new Set(diff.filter((op) => op.op === 'ref').map((op) => op.ref.commitId)),
+        references,
       })
+    }
     if (headChanged && advance) this.storage.heads.set(advance.name, id)
     if (hot) this.storage.installHot(hot)
     if (isNew) this.emitCommitted(node)
@@ -595,7 +591,11 @@ export class WorldService extends Service<WorldConfig> {
     return Object.freeze({ ...node, message: cloneValue(message), diff: cloneDiff(diff) })
   }
 
-  /** Safely delete a leaf commit if it has no children, no incoming `StateRef` pins, and no `head` pointers. */
+  /**
+   * Safely delete a leaf commit if it has no children, no incoming `StateRef`
+   * pins, and no `head` pointers. A commit that only anchors itself is still
+   * deletable because self references never create pin edges.
+   */
   popLeaf(id: CommitHash): Result<void, WorldError> {
     return this.write(() => {
       const record = this.requireCommit(id)
@@ -630,6 +630,19 @@ export class WorldService extends Service<WorldConfig> {
   /**
    * Replay contiguous `sourceChainIds` onto `ontoId` using atomic prefix-root group
    * three-way prechecks, stopping on the first conflict without writing partial state.
+   *
+   * Self references are aligned across both sides of the replay:
+   * - a source ref whose target is the source node itself is dehydrated to
+   *   {@link SELF_COMMIT}, skipping the policy and the historical existence
+   *   check until the new node materializes it;
+   * - a base-view ref written by a source node that is already in the remap
+   *   table is force-synced to that node's replacement regardless of
+   *   `remapRefs`, so previously replayed self anchors do not look like
+   *   external divergence;
+   * - a desired self reference never equals a target reference to an existing
+   *   commit, so the same-change pruning cannot drop it.
+   *
+   * `options.initialRemap` seeds the remap table for resuming across batches.
    */
   rebase(
     sourceChainIds: readonly CommitHash[],
@@ -666,10 +679,28 @@ export class WorldService extends Service<WorldConfig> {
             fail({ kind: 'dangling_ref', refCommitId: mapped.commitId, refPath: mapped.path })
           return mapped
         }
+        const forceSelfSync = (ref: StateRef, originCommitId: CommitHash): StateRef => {
+          if (ref.commitId === originCommitId) {
+            const replacement = remapped.get(originCommitId)
+            if (replacement !== undefined) {
+              if (!this.hasCommit(replacement))
+                fail({ kind: 'dangling_ref', refCommitId: replacement, refPath: ref.path })
+              return cloneRef({ commitId: replacement, path: ref.path })
+            }
+          }
+          return transform(ref)
+        }
         const effective = cloneDiff(
-          this.storage
-            .diff(sourceId)
-            .map((op) => (op.op === 'ref' ? { ...op, ref: transform(op.ref) } : op)),
+          this.storage.diff(sourceId).map((op) => {
+            if (op.op !== 'ref') return op
+            if (op.ref.commitId === sourceId)
+              return {
+                op: 'ref' as const,
+                path: op.path,
+                ref: { commitId: SELF_COMMIT, path: op.ref.path },
+              }
+            return { ...op, ref: transform(op.ref) }
+          }),
         )
         const groups: { root: Path; ops: DiffOp[] }[] = []
         for (const op of effective) {
@@ -683,7 +714,7 @@ export class WorldService extends Service<WorldConfig> {
         for (const group of groups) {
           const base =
             source.parentId.kind === 'some'
-              ? transformView(this.view(source.parentId.value, group.root), transform)
+              ? this.view(source.parentId.value, group.root, forceSelfSync)
               : NONE
           const desired = this.desiredView(base, group.root, group.ops)
           const target = this.view(tip, group.root)
@@ -714,7 +745,7 @@ export class WorldService extends Service<WorldConfig> {
               const targetAncestor = this.view(tip, ancestorPath)
               const baseAncestor =
                 source.parentId.kind === 'some'
-                  ? transformView(this.view(source.parentId.value, ancestorPath), transform)
+                  ? this.view(source.parentId.value, ancestorPath, forceSelfSync)
                   : NONE
               const incomingAncestor = this.desiredView(
                 baseAncestor,
@@ -736,6 +767,8 @@ export class WorldService extends Service<WorldConfig> {
             }
           }
           if (ancestorConflict) continue
+          // Desired SELF_COMMIT leaves never byte-equal a materialized target
+          // ref, so a self write cannot be pruned as a same-change no-op here.
           if (viewsEqual(target, desired)) continue
           if (viewsEqual(target, base)) {
             retained.push(...group.ops)

@@ -21,6 +21,11 @@ export type Value = ScalarValue | readonly ScalarValue[]
  * specific {@link CommitHash}.
  */
 export interface StateRef {
+  /**
+   * Target commit. Inside `CommitInput.diff` only, {@link SELF_COMMIT} may be
+   * used to address the commit being created; it is hashed canonically and
+   * materialized to the real id before storage or reads.
+   */
   readonly commitId: CommitHash
   /** Empty path means the whole state tree at `commitId`. */
   readonly path: Path
@@ -67,6 +72,12 @@ export interface CommitInput {
   /** Parent node; `NONE` creates a new root. */
   readonly parentId: Option<CommitHash>
   readonly message: Value
+  /**
+   * Canonical diff. `op === 'ref'` may use {@link SELF_COMMIT} to point at the
+   * commit being created; such targets skip historical existence checks but
+   * must exist in this commit's final state tree, be `[]`, or start with
+   * `'$message'`. They are materialized to the new id before persistence.
+   */
   readonly diff?: StateDiff
   /**
    * Optionally validate and advance a named cursor atomically with the commit.

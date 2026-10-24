@@ -41,6 +41,35 @@ interface ContentFrame {
   readonly pushed: boolean
 }
 
+/** First-touch snapshot of one draft node, sufficient to undo a scope. */
+interface DraftSnapshot {
+  readonly node: DraftNode
+  readonly entry: LeafEntry | undefined
+  readonly children: Map<string, DraftNode> | undefined
+  readonly tombstone: boolean
+  readonly deleteTouched: boolean
+}
+
+/**
+ * One inserted draft node, sufficient to detach exactly that creation.
+ * `siblings` is the Map identity that received the insertion; a later snapshot
+ * restoration may replace `parent.children` with a different (pre-scope) Map,
+ * so rollback must never infer ownership from `parent` + `key` alone.
+ */
+interface CreatedNode {
+  readonly parent: DraftNode
+  readonly key: string
+  readonly node: DraftNode
+  readonly siblings: Map<string, DraftNode>
+}
+
+/** One rollback scope: first-touch snapshots plus nodes created inside it. */
+interface RollbackJournal {
+  readonly snapshots: Map<DraftNode, DraftSnapshot>
+  /** Nodes that did not exist before the scope, in creation order. */
+  readonly created: CreatedNode[]
+}
+
 function del(path: Path): DiffOp {
   return Object.freeze({ op: 'del', path: Object.freeze([...path]) })
 }
@@ -67,9 +96,91 @@ function del(path: Path): DiffOp {
 export class DraftOverlay implements StateWriter {
   private readonly base: StateReader
   private readonly root = new DraftNode()
+  /**
+   * Monotonic write counter, incremented by every `setEntry`/`deleteTree` and
+   * by rollback. Derived indices (backlinks, link validation) key caches on it
+   * so a draft is re-scanned exactly when its physical state changed.
+   */
+  revision = 0
+  /** Undo journals for {@link beginScope}; the newest scope is last. */
+  private readonly journals: RollbackJournal[] = []
 
   constructor(base: StateReader = EMPTY_STATE) {
     this.base = base
+  }
+
+  /**
+   * Open a rollback scope. Every draft write until the matching
+   * {@link commitScope} or {@link rollbackScope} records enough state to undo
+   * itself, including intermediate nodes created while walking a path.
+   * Scopes nest; accepting an inner scope merges its undo records upward.
+   *
+   * Used by the three-phase link cascade, which must discard a tentatively
+   * applied mutation completely when a `reject` edge remains live.
+   */
+  beginScope(): void {
+    this.journals.push({ snapshots: new Map(), created: [] })
+  }
+
+  /** Accept the newest scope, handing its undo records to the enclosing scope. */
+  commitScope(): void {
+    const journal = this.journals.pop()
+    if (journal === undefined) throw new Error('No draft rollback scope is open')
+    const parent = this.journals.at(-1)
+    if (parent === undefined) return
+    for (const [node, snapshot] of journal.snapshots) {
+      if (!parent.snapshots.has(node)) parent.snapshots.set(node, snapshot)
+    }
+    parent.created.push(...journal.created)
+  }
+
+  /**
+   * Undo every write made since the newest {@link beginScope} and close that
+   * scope. Field snapshots are restored first, which may replace a node's
+   * children Map with its pre-scope identity. Created nodes are then detached
+   * only when their recorded insertion target is still the owning Map and the
+   * key still holds that exact node. A key that was re-created after the
+   * snapshot therefore never deletes a restored pre-scope child.
+   */
+  rollbackScope(): void {
+    const journal = this.journals.pop()
+    if (journal === undefined) throw new Error('No draft rollback scope is open')
+    for (const snapshot of journal.snapshots.values()) {
+      snapshot.node.entry = snapshot.entry
+      snapshot.node.children = snapshot.children
+      snapshot.node.tombstone = snapshot.tombstone
+      snapshot.node.deleteTouched = snapshot.deleteTouched
+    }
+    for (let index = journal.created.length - 1; index >= 0; index--) {
+      const created = journal.created[index]!
+      if (created.parent.children !== created.siblings) continue
+      if (created.siblings.get(created.key) !== created.node) continue
+      created.siblings.delete(created.key)
+    }
+    this.revision += 1
+  }
+
+  /** Snapshot a node before its first mutation inside the current scope. */
+  private record(node: DraftNode): void {
+    const journal = this.journals.at(-1)
+    if (journal === undefined || journal.snapshots.has(node)) return
+    journal.snapshots.set(node, {
+      node,
+      entry: node.entry,
+      children: node.children,
+      tombstone: node.tombstone,
+      deleteTouched: node.deleteTouched,
+    })
+  }
+
+  /** Remember an intermediate node that did not exist before the current scope. */
+  private recordCreated(
+    parent: DraftNode,
+    key: string,
+    node: DraftNode,
+    siblings: Map<string, DraftNode>,
+  ): void {
+    this.journals.at(-1)?.created.push({ parent, key, node, siblings })
   }
 
   getEntry(path: Path): LeafEntry | undefined {
@@ -140,18 +251,24 @@ export class DraftOverlay implements StateWriter {
       let child = node.children?.get(key)
       if (child === undefined) {
         child = new DraftNode()
-        if (node.children === undefined) node.children = new Map()
-        node.children.set(key, child)
+        const siblings = node.children ?? new Map<string, DraftNode>()
+        node.children = siblings
+        siblings.set(key, child)
+        this.recordCreated(node, key, child, siblings)
       }
       node = child
     }
     // A previous tombstone stays in place: base siblings and descendants stay
     // hidden, and only explicitly rewritten leaves become visible again.
+    this.record(node)
     node.entry = owned
+    this.revision += 1
   }
 
   deleteTree(path: Path): void {
     validatePath(path)
+    this.revision += 1
+    this.record(this.root)
     this.root.deleteTouched = true
     if (path.length === 0) {
       this.root.entry = undefined
@@ -168,9 +285,12 @@ export class DraftOverlay implements StateWriter {
         // writes survive below it, so the delete is a no-op.
         if (hidden) return
         child = new DraftNode()
-        if (node.children === undefined) node.children = new Map()
-        node.children.set(key, child)
+        const siblings = node.children ?? new Map<string, DraftNode>()
+        node.children = siblings
+        siblings.set(key, child)
+        this.recordCreated(node, key, child, siblings)
       }
+      this.record(child)
       child.deleteTouched = true
       node = child
       if (node.tombstone) hidden = true

@@ -6,7 +6,7 @@
       "name": "sekaisen-monorepo",
       "devDependencies": {
         "@biomejs/biome": "^2.6.2",
-        "@sekaisen/plugin-schema": "workspace:*",
+        "@sekaisen/plugin-perspective": "workspace:*",
         "@types/bun": "1.3.14",
         "@types/node": "^22.20.5",
         "typescript": "^5.9.3",
@@ -17,6 +17,16 @@
       "version": "0.1.0",
       "dependencies": {
         "@noble/hashes": "2.0.1",
+      },
+    },
+    "packages/plugin-perspective": {
+      "name": "@sekaisen/plugin-perspective",
+      "version": "0.1.0",
+      "dependencies": {
+        "@sekaisen/core": "workspace:*",
+        "@sekaisen/plugin-schema": "workspace:*",
+        "@sekaisen/plugin-world": "workspace:*",
+        "cordis": "4.0.0-rc.11",
       },
     },
     "packages/plugin-schema": {
@@ -63,6 +73,8 @@
     "@noble/hashes": ["@noble/hashes@2.0.1", "", {}, "sha512-XlOlEbQcE9fmuXxrVTXCTlG2nlRXa9Rj3rr5Ue/+tX+nmkgbX720YHh0VR3hBF9xDvwnb8D2shVGOwNx+ulArw=="],
 
     "@sekaisen/core": ["@sekaisen/core@workspace:packages/core"],
+
+    "@sekaisen/plugin-perspective": ["@sekaisen/plugin-perspective@workspace:packages/plugin-perspective"],
 
     "@sekaisen/plugin-schema": ["@sekaisen/plugin-schema@workspace:packages/plugin-schema"],
 

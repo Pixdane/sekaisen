@@ -58,6 +58,30 @@ export type ContainerPresence =
  */
 export type SchemaMetaMap = Readonly<Record<string, Value>>
 
+/**
+ * Open, declaration-mergeable metadata accepted by every builder `.meta()`.
+ *
+ * Upper plugins extend this interface with `declare module '@sekaisen/plugin-schema'`
+ * to obtain compile-time checks for their declarative markers (visibility,
+ * salience, link roles, ...) while `plugin-schema` itself stays domain-free.
+ * Every present key is persisted flat under `['$schemas', ..., 'metadata', key]`
+ * and must be a legal {@link Value}; nesting arrays is forbidden. An `undefined`
+ * value means "leave this key unchanged" and is never persisted, so `.meta()`
+ * calls compose without having to delete keys explicitly.
+ *
+ * @example
+ * ```ts
+ * declare module '@sekaisen/plugin-schema' {
+ *   interface SchemaNodeMeta {
+ *     readonly visibility?: 'surface' | 'self' | 'ref'
+ *   }
+ * }
+ * ```
+ */
+export interface SchemaNodeMeta {
+  readonly [key: string]: Value | undefined
+}
+
 /** Leaf node definition. */
 export interface LeafSchemaNode<
   TValueKind extends LeafValueKind = LeafValueKind,
@@ -438,7 +462,7 @@ export interface LeafBuilder<
   /** Set a well-formed Unicode description; it does not impose a value constraint. */
   desc(description: string): LeafBuilder<TKind, TPresence>
   /** Merge declarative metadata, validating keys and copying values. */
-  meta(meta: SchemaMetaMap): LeafBuilder<TKind, TPresence>
+  meta(meta: SchemaNodeMeta): LeafBuilder<TKind, TPresence>
 }
 
 /** Immutable struct builder; initial presence is derived from its declared fields. */
@@ -454,7 +478,7 @@ export interface StructBuilder<
   /** Set a well-formed Unicode description on a new builder. */
   desc(description: string): StructBuilder<TFields, TAllowCustom, TPresence>
   /** Merge validated declarative metadata on a new builder. */
-  meta(meta: SchemaMetaMap): StructBuilder<TFields, TAllowCustom, TPresence>
+  meta(meta: SchemaNodeMeta): StructBuilder<TFields, TAllowCustom, TPresence>
 }
 
 /** Immutable Map builder; defaulted Maps start empty and never create implicit entries. */
@@ -467,11 +491,91 @@ export interface MapBuilder<
   /** Set a well-formed Unicode description on a new builder. */
   desc(description: string): MapBuilder<TValueSchema, TPresence>
   /** Merge validated declarative metadata on a new builder. */
-  meta(meta: SchemaMetaMap): MapBuilder<TValueSchema, TPresence>
+  meta(meta: SchemaNodeMeta): MapBuilder<TValueSchema, TPresence>
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Graph links (foreign keys)                      */
+/* -------------------------------------------------------------------------- */
+
+/** Behaviour applied to live referencing edges when a linked target disappears. */
+export type OnDeletePolicy = 'reject' | 'cascade' | 'unlink'
+
+/**
+ * Declarative traits of a graph foreign key built by `s.link` / `s.linkList`.
+ *
+ * Links are ordinary `str` / `list:str` leaves whose values are canonical
+ * `encodePathKey(targetInstancePath)` strings; the traits are stored as flat
+ * metadata on the leaf so a Writer catalog is self-describing:
+ * `$linkTargetRoots`, `$linkTargetRootsDynamic`, `$linkAcyclic`,
+ * `$linkExclusiveRole`, `$linkOnDelete`.
+ *
+ * Registration rules (checked by `define` / `augment`):
+ * - a single-target `s.link` with `onDelete: 'unlink'` MUST be optional, so the
+ *   relation can legally become `NONE`;
+ * - a multi-target `s.linkList` MUST NOT declare `exclusiveRole`.
+ */
+export interface LinkTraits {
+  /**
+   * Target root paths this link may point into, e.g.
+   * `[['entities', 'character'], ['entities', 'location']]`.
+   *
+   * Must be a non-empty array of non-empty identifier paths. Targets are
+   * matched with `encodePathKey` prefix semantics.
+   */
+  readonly targetRoots: readonly Path[]
+  /**
+   * Explicit opt-in for dynamically registered target roots.
+   *
+   * When `true`, final link validation additionally accepts a target when it is
+   * a live Struct instance under ANY currently registered Writer root of the
+   * commit's catalog. Static `targetRoots` still apply and remain mandatory, so
+   * this is an add-on (never a replacement) for `hostEntity`-style links whose
+   * concrete roots are owned and registered by other plugins after this schema
+   * was defined. Targets must still exist and be Struct instances; the flag is
+   * persisted (`$linkTargetRootsDynamic`) so historical Writer catalogs keep
+   * identical validation semantics.
+   */
+  readonly dynamicTargetRoots?: boolean
+  /**
+   * Reject cycles along the union of links sharing the same role tags
+   * (`exclusiveRole` and/or metadata `linkRoles`), e.g. `A.master -> B` plus
+   * `B.controller -> A`. Once ANY declaration in a union requests acyclicity,
+   * every live edge of that union participates, including fields that omit the
+   * flag. Activation is a Schema declaration fact: it applies even when the
+   * marked field has no live instance or its list is empty. Untagged
+   * declarations form a union with themselves (across concrete instances) by
+   * schema-declaration identity, never a global untagged union.
+   *
+   * A link leaf must be owned by a Struct instance (`s.struct` field, including
+   * augmented fields); a registered root leaf or a root Map of link values is
+   * rejected at registration because backlinks require a source instance.
+   */
+  readonly acyclic?: boolean
+  /**
+   * Exclusive relation group (`'parent'`, `'delegate'`, ...). Only legal on a
+   * single-target `s.link`: one instance may have at most one non-empty link
+   * per exclusive role, guaranteeing a strict single-parent tree.
+   */
+  readonly exclusiveRole?: string
+  /** Target-deletion policy; defaults to `'reject'`. */
+  readonly onDelete?: OnDeletePolicy
+}
+
+/**
+ * Link constructors merged into {@link SchemaBuilders} (`s.link` / `s.linkList`).
+ * Both build plain `str` / `list:str` leaves whose trait metadata is validated
+ * immediately; registration-time rules are enforced by the schema service.
+ */
+export interface SchemaBuildersLinkExtension {
+  /** Required single-target foreign key (`str` leaf storing an encoded instance path). */
+  link(traits: LinkTraits): LeafBuilder<'str'>
+  /** Required multi-target foreign key (`list:str` leaf of encoded instance paths). */
+  linkList(traits: LinkTraits): LeafBuilder<'list:str'>
 }
 
 /** Fluent schema factories; compose configured children before registration. */
-export interface SchemaBuilders {
+export interface SchemaBuilders extends SchemaBuildersLinkExtension {
   /** Build a required boolean leaf. */
   bool(): LeafBuilder<'bool'>
   /** Build a required finite-number leaf; domain constraints require a validator. */
@@ -585,7 +689,7 @@ export interface HistoricalLeafInspection {
   readonly meta: SchemaMetaMap
 }
 
-/** Historical struct including Writer fields, dormant names and instance custom leaves. */
+/** Historical struct including Writer fields, dormant names, instance custom leaves and instance metadata. */
 export interface HistoricalStructInspection {
   readonly nodeKind: 'struct'
   readonly path: Path
@@ -593,6 +697,12 @@ export interface HistoricalStructInspection {
   readonly fields: Readonly<Record<string, Option<HistoricalNodeInspection>>>
   readonly dormantFieldKeys: readonly string[]
   readonly customFields: Readonly<Record<string, FieldValueWithMeta<Value | StateRef>>>
+  /**
+   * Instance-level runtime metadata copied from `[...path, '$meta', key]`.
+   * Symmetric with leaf metadata: it overrides declarative defaults per
+   * instance and is never interpreted by the schema layer itself.
+   */
+  readonly meta: SchemaMetaMap
 }
 
 /** Historical Map containing only physically present, concrete entries. */
@@ -609,6 +719,27 @@ export type HistoricalNodeInspection =
   | HistoricalStructInspection
   | HistoricalMapInspection
 
+/**
+ * Result of resolving an arbitrary {@link StateRef}.
+ *
+ * `$message` refs address the commit's decoded message payload instead of the
+ * state tree, so they resolve to a message kind plus an optional sub-value.
+ * Every other ref faithfully inspects the historical state node it names.
+ */
+export type ResolvedStateRefValue =
+  | {
+      readonly targetKind: 'state_node'
+      /** Historical node at `(ref.commitId, ref.path)`; `NONE` when physically absent. */
+      readonly inspection: Option<HistoricalNodeInspection>
+    }
+  | {
+      readonly targetKind: 'commit_message'
+      /** Decoded message kind (`'$text'` for plain string messages). */
+      readonly messageKind: string
+      /** Value at `ref.path.slice(1)` inside the decoded payload; `NONE` when absent. */
+      readonly value: Option<unknown>
+    }
+
 /* -------------------------------------------------------------------------- */
 /*                                Errors                                    */
 /* -------------------------------------------------------------------------- */
@@ -622,6 +753,14 @@ export type SchemaValidationReason =
   | 'custom_key_shadows_struct_field'
   | 'undefined_custom_key'
   | 'instance_not_found'
+  /** A `reject` link still points at an instance removed by this operation. */
+  | 'referenced_target_not_deletable'
+  /** A link value does not encode an existing, permitted Struct instance. */
+  | 'invalid_link_target'
+  /** The role union of acyclic links would contain a directed cycle. */
+  | 'link_cycle'
+  /** Two non-empty links of the same exclusive role exist on one instance. */
+  | 'exclusive_link_conflict'
 
 /**
  * Expected schema-layer failures returned by Result-based APIs.
@@ -644,6 +783,25 @@ export type SchemaError =
         | 'augment_target_not_struct'
         | 'field_name_collision'
         | 'ref_not_allowed_in_message'
+        /** Single-target link with `onDelete: 'unlink'` must be optional. */
+        | 'link_unlink_requires_optional'
+        /** `exclusiveRole` is only meaningful on single-target links. */
+        | 'link_list_exclusive_role_forbidden'
+        /**
+         * A link leaf is reachable from a registered root without crossing a
+         * Struct instance (for example root `s.link()` or root
+         * `s.map(s.link())`). Backlinks and validation are Struct-owned, so
+         * such placements would otherwise be registered but silently skipped.
+         */
+        | 'link_source_struct_required'
+        /**
+         * A custom leaf definition carries `$link*` metadata. Custom leaves are
+         * not traversed by the link scanners, so they cannot own backlinks or
+         * participate in link validation.
+         */
+        | 'link_custom_field_forbidden'
+        /** `$link*` metadata is malformed or attached to a non-string leaf. */
+        | 'invalid_link_traits'
     }
   | {
       readonly kind: 'schema_drift_requires_sync'
@@ -814,6 +972,79 @@ export interface ReadonlySchemaView {
    * shallow physical directory listing that bypasses malformed-member errors.
    */
   listKeys(mapLens: MapLens): Result<readonly string[], SchemaError>
+
+  /**
+   * Root paths addressable by trusted introspection in this fixed view: the
+   * union of the captured Reader roots and the view's Writer roots (including
+   * Writer-only dormant roots), deduplicated and sorted by UTF-8 key. Map roots
+   * are included. Mutation-addressable lenses remain Reader-only.
+   */
+  listRootPaths(): readonly Path[]
+
+  /**
+   * Inspect the physical node at a logical path using the Writer catalog bound
+   * to this view. Unlike `get`, defaults are never invented: absent nodes yield
+   * `NONE` and only physically stored fields/custom leaves are returned.
+   * On a transaction this reads the current draft, including writer-faithful
+   * physical layout of nodes created earlier in the same callback.
+   */
+  inspectInstance(nodePath: Path): Result<Option<HistoricalNodeInspection>, SchemaError>
+
+  /**
+   * Resolve the Writer declaration at `nodePath` without reading or requiring a
+   * physical value, ancestor container or concrete Map member.
+   *
+   * Traversal starts at the longest matching Writer root bound to this view and
+   * walks declared Struct fields, Map value schemas (every concrete member ID
+   * resolves to the same value declaration) and stored instance-specific custom
+   * leaf specs. A declared optional leaf, an absent Map member and any nested
+   * path below an absent ancestor therefore still yield their declaration.
+   * Historical views use the Writer catalog stored in their commit, so later
+   * Reader registrations and active Reader-only definitions never leak into an
+   * old view. Transaction drafts use the same Writer-faithful basis as
+   * {@link ReadonlySchemaView.inspectInstance}, so declarations created in the
+   * current draft (root definitions for a new root commit and custom specs
+   * written earlier in the callback) are visible.
+   *
+   * The returned AST is a deep, frozen copy owned by the caller; no state is
+   * materialized and no write occurs. Paths outside the Writer catalog, paths
+   * that descend through a leaf, and unknown custom keys yield `NONE`. A stored
+   * custom declaration that is structurally malformed (including a missing
+   * `$spec`) surfaces as `corrupted_instance_data` rather than `NONE`; an
+   * absent `$spec` for an unknown custom key remains `NONE`.
+   */
+  writerSchemaAt(nodePath: Path): Result<Option<SchemaNode>, SchemaError>
+
+  /**
+   * Build the real lens for any path covered by a captured Reader root:
+   * Struct instances, Map roots, concrete Map entries (dynamic IDs) and nested
+   * declared field paths. Map-entry lenses are normalized to optional presence,
+   * mirroring `mapLens.at(id)`, so `tx.delete` and optional writes accept them.
+   * Paths outside the captured Reader catalog return `Err` (never a guess).
+   */
+  lensAt(nodePath: Path): Result<AnyReadableLens, SchemaError>
+
+  /**
+   * Read instance-level runtime metadata (`[...instancePath, '$meta', key]`).
+   * `NONE` means the Struct instance is logically absent; a virtual defaulted
+   * instance yields `some({})` because it has no physical metadata.
+   */
+  getInstanceMeta(lens: StructLens): Result<Option<SchemaMetaMap>, SchemaError>
+
+  /**
+   * Live incoming link edges pointing at `targetInstancePath` in this exact view.
+   *
+   * Backed by an index built from the view's physical state that is bound to the
+   * view (fixed commit or current draft) and invalidated whenever the draft
+   * changes, so results never leak across commits or stale drafts. Locating the
+   * target bucket is O(1); copying/filtering the `k` results is O(k). Only
+   * currently live edges are returned: the source instance must exist and its
+   * link leaf must currently point at the target.
+   */
+  backlinks(
+    targetInstancePath: Path,
+    filter?: BacklinkQueryFilter,
+  ): Result<readonly BacklinkEntry[], SchemaError>
 }
 
 /** Struct patch input: every key optional; only optional fields accept null/NONE. */
@@ -831,6 +1062,31 @@ export type DeletableLens =
   | CustomFieldLens
   | UntypedCustomFieldLens
 
+/** One live incoming graph edge found by {@link ReadonlySchemaView.backlinks}. */
+export interface BacklinkEntry {
+  /** Path of the source Struct instance emitting the reference. */
+  readonly sourceInstancePath: Path
+  /** Registered root path the source instance belongs to. */
+  readonly sourceRootPath: Path
+  /** Link field path relative to `sourceInstancePath` (e.g. `['pet', 'owner']`). */
+  readonly fieldRelativePath: Path
+  /** Full leaf definition of the link field, including its `$link*` metadata. */
+  readonly fieldSpec: LeafSchemaNode
+  /** Copy of the field's target-deletion policy. */
+  readonly onDelete: OnDeletePolicy
+}
+
+/** Optional narrowing applied by {@link ReadonlySchemaView.backlinks}. */
+export interface BacklinkQueryFilter {
+  /** Only return edges whose source instance belongs to this registered root. */
+  readonly sourceRootPath?: Path
+  /**
+   * Custom predicate over the link field's full leaf definition, e.g. filtering
+   * on `fieldSpec.metadata['linkRoles']`. Throwing propagates to the caller.
+   */
+  readonly filterFieldSpec?: (spec: LeafSchemaNode) => boolean
+}
+
 /**
  * Mutable draft supplied only to the synchronous `SchemaService.commit` callback.
  * Mutations affect subsequent reads in this draft, not the parent commit.
@@ -838,11 +1094,36 @@ export type DeletableLens =
  * Reads require the backing World storage to remain available.
  * Required ancestors must already exist; mutation methods throw schema failures
  * rather than returning `Result`. Let failures escape to reject the draft;
- * operations are not individual savepoints if their failures are caught.
+ * individual mutators are not savepoints, so wrap a group whose caught failure
+ * must not leave partial writes in {@link SchemaTransaction.atomic}.
  * Mutation methods throw after the callback ends. Use `some()`/`NONE` for
  * actual Option wrappers; plain `kind`/`value` objects remain business data.
  */
 export interface SchemaTransaction extends ReadonlySchemaView {
+  /**
+   * Run a synchronous callback as one draft savepoint.
+   *
+   * Every physical write made by `operation` — values, deletes, custom leaf
+   * definitions and metadata — is isolated through the draft's nested rollback
+   * journals. If `operation` returns normally, the savepoint is accepted and
+   * its writes merge into any enclosing scope. If it throws, every enclosed
+   * write is restored to the state captured at entry and the exact thrown value
+   * crosses this boundary unchanged; the caller may catch it, keep earlier
+   * (pre-savepoint) writes and either continue or let the draft commit them.
+   *
+   * Scopes nest: an inner successful savepoint is undone by an outer rollback,
+   * and link-cascade scopes opened by mutators compose with the savepoint.
+   * This is a synchronous-only primitive; returning a thenable throws
+   * `TypeError` and rolls the savepoint back. The transaction must still be
+   * active. This method is deliberately absent from
+   * {@link ReadonlySchemaView}.
+   *
+   * @param operation Synchronous draft mutation closure.
+   * @returns The callback's return value after the savepoint is accepted.
+   * @throws The callback's exact thrown value after rolling its writes back.
+   */
+  atomic<T>(operation: () => T): T
+
   /**
    * Replace fields owned by the struct lens, preserving out-of-scope augment,
    * dormant and custom data on an existing instance. Omitted owned optional
@@ -905,6 +1186,15 @@ export interface SchemaTransaction extends ReadonlySchemaView {
     value: LeafValueTypeMap[TLeaf['valueKind']],
     meta: Readonly<Record<string, Value | null>>,
   ): void
+
+  /**
+   * Merge instance-level runtime metadata into a physically existing Struct.
+   * Values are validated and copied before any write; `null` deletes that key,
+   * and omitted keys survive. Absent or virtual instances fail with
+   * `validation_failed` / `instance_not_found`; this never creates an instance
+   * or touches fields, customs, leaf metadata or `$exists`.
+   */
+  setInstanceMeta(lens: StructLens, meta: Readonly<Record<string, Value | null>>): void
 
   /**
    * Update only supplied fields on an existing struct, within the lens scope.
@@ -1106,6 +1396,21 @@ export interface SchemaServiceApi {
     commitId: CommitHash,
     prism: MessagePrism<TKind, TSchema>,
   ): Result<Option<InferCoreOutput<TSchema>>, SchemaError>
+
+  /**
+   * Resolve an arbitrary state reference.
+   *
+   * - `ref.path[0] === '$message'` decodes `getMessage(ref.commitId)` and walks
+   *   `ref.path.slice(1)` through the payload, unwrapping `Option` wrappers so a
+   *   caller may address nested optional fields directly. Absent sub-paths yield
+   *   `ok({ targetKind: 'commit_message', messageKind, value: NONE })`.
+   * - Every other ref faithfully inspects `(ref.commitId, ref.path)` through the
+   *   stored Writer catalog, so historical values survive later mutation/deletion.
+   *
+   * Messaging requires the backing World commit; invalid refs return a
+   * structured failure rather than throwing.
+   */
+  resolveRef(ref: StateRef): Result<ResolvedStateRefValue, SchemaError>
 
   /**
    * Apply one synchronous copy-on-write draft callback without copying the full

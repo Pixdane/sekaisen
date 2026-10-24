@@ -66,6 +66,10 @@ export interface StoredCommit {
   readonly id: CommitHash
   readonly parentId: Option<CommitHash>
   readonly children: Set<CommitHash>
+  /**
+   * Commit ids referenced by this node's `StateRef` leaves. Self anchors
+   * (`ref.commitId === id`) are intentionally absent so they never pin the node.
+   */
   readonly references: Set<CommitHash>
   readonly index: OriginDirectoryNode
 }
@@ -127,6 +131,11 @@ type HotJob =
  * and lazily loads cold values or weak-only commit messages. Head transitions
  * stage sparse residency patches and skip reference-shared index subtrees;
  * live counts change only when the caller publishes a successful transaction.
+ *
+ * Self-referencing `StateRef`s (`commitId === node.id`) are canonicalized by
+ * excluding them from `commit_refs`, `pins` and startup reconciliation, so a
+ * commit is never pinned by its own anchor. Any persisted self edge is
+ * rejected as corruption.
  */
 export class WorldStorage {
   readonly commits = new Map<CommitHash, StoredCommit>()
@@ -273,7 +282,8 @@ export class WorldStorage {
             throw new InvariantError(`Invalid ref metadata: ${row.id}/${entry.path_key}`)
           }
           const edges = expectedEdges.get(row.id) ?? new Set<CommitHash>()
-          edges.add(entry.ref_commit_id)
+          // A StateRef to its own commit is a self anchor, never a pin edge.
+          if (entry.ref_commit_id !== row.id) edges.add(entry.ref_commit_id)
           expectedEdges.set(row.id, edges)
           return {
             op: 'ref' as const,
@@ -303,6 +313,8 @@ export class WorldStorage {
       ) as CommitHash
       if (!ids.has(sourceId) || !ids.has(targetId))
         throw new InvariantError('Orphan commit_refs edge')
+      if (sourceId === targetId)
+        throw new InvariantError(`commit_refs contains a self edge: ${sourceId}`)
       const edges = actualEdges.get(sourceId) ?? new Set<CommitHash>()
       edges.add(targetId)
       actualEdges.set(sourceId, edges)
@@ -356,7 +368,11 @@ export class WorldStorage {
     }
   }
 
-  /** Register a verified commit topology record and its outgoing reference pins in memory. */
+  /**
+   * Register a verified commit topology record and its outgoing reference pins
+   * in memory. Self anchors are absent from `record.references`, so they never
+   * appear in `pins` or `getReferencingCommits`.
+   */
   add(record: StoredCommit): void {
     this.commits.set(record.id, record)
     if (record.parentId.kind === 'some')
@@ -516,7 +532,11 @@ export class WorldStorage {
     }
   }
 
-  /** Persist a new `CommitNode` and its outgoing `commit_refs` edges inside an active transaction. */
+  /**
+   * Persist a new `CommitNode` and its outgoing `commit_refs` edges inside an
+   * active transaction. A `StateRef` whose target equals `node.id` is a self
+   * anchor and is deliberately not written to `commit_refs`.
+   */
   insert(node: CommitNode): void {
     const message = encodeStoredValue(node.message)
     this.driver
@@ -545,7 +565,7 @@ export class WorldStorage {
           op.op === 'ref' ? op.ref.commitId : null,
           op.op === 'ref' ? encoder.encode(encodePathKey(op.ref.path)) : null,
         )
-      if (op.op === 'ref') targets.add(op.ref.commitId)
+      if (op.op === 'ref' && op.ref.commitId !== node.id) targets.add(op.ref.commitId)
     }
     const statement = this.driver.prepare(
       'INSERT INTO commit_refs (source_commit_id,target_commit_id) VALUES (?,?)',

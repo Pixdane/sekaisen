@@ -25,6 +25,16 @@ export const utf8Decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: tr
 
 const EMPTY_PATH: Path = Object.freeze([])
 
+/**
+ * Sentinel commit id valid only inside `CommitInput.diff` for `op === 'ref'`.
+ *
+ * It means "the StateRef target is the commit produced by this very `commit()`
+ * call". The literal string is hashed canonically (`0x04 + Uint32BE(5) +
+ * "$self"`) and replaced by the computed {@link CommitHash} before the node is
+ * stored, indexed or returned. See {@link dehydrateSelfRefs} for the inverse.
+ */
+export const SELF_COMMIT = '$self' as CommitHash
+
 /** A `TypeError` carrying the structured world error the caller should return. */
 class CodecError extends TypeError {
   readonly worldError: WorldError
@@ -438,6 +448,31 @@ function encodeCanonicalEntry(entry: LeafEntry): Uint8Array {
   return writer.finish()
 }
 
+/**
+ * Encode a {@link Value} into its canonical binary representation.
+ *
+ * The grammar is the same one used for commit messages and hashing:
+ * - scalars: `0x01` null, `0x02` boolean, `0x03` Float64BE finite number,
+ *   `0x04` length-prefixed UTF-8 string, `0x05` length-prefixed bytes;
+ * - scalar lists: `0x06` + `Uint32BE(count)` + scalars (never nested).
+ *
+ * The input is validated and normalized exactly like `commit()` payloads
+ * (`-0` becomes `0`), and a detached buffer is returned. Primarily used by
+ * upper layers (e.g. `@sekaisen/plugin-schema`) to store a `Value` as a rumor
+ * payload without JSON or type-narrowing loss.
+ *
+ * @example
+ * ```ts
+ * const bytes = encodeValue(['a', 1, new Uint8Array([2])])
+ * decodeValue(bytes) // ['a', 1, Uint8Array([2])]
+ * ```
+ * @throws TypeError when `value` contains a non-finite number, a malformed
+ * string, a nested list or an unsupported scalar.
+ */
+export function encodeValue(value: Value): Uint8Array {
+  return encodeCanonicalValue(cloneValue(value))
+}
+
 /** Equality is byte equality under the canonical encoding above. */
 export function valueEquals(a: Value, b: Value): boolean {
   const left = cloneValue(a)
@@ -553,17 +588,116 @@ export function cloneDiff(diff: StateDiff): StateDiff {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                          Self reference rewrite                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Rewrite matching `op === 'ref'` commit ids, re-canonicalizing the result.
+ *
+ * A `ref` is matched on its `commitId` only; its `path` is preserved verbatim.
+ * The returned diff is validated, prefix-checked, path-sorted and frozen, so
+ * both helpers below are strict inverses on canonical diffs.
+ */
+function rewriteSelfRefs(
+  diff: StateDiff,
+  matches: (commitId: CommitHash) => boolean,
+  replacement: CommitHash,
+): StateDiff {
+  const ops = diff.map((op) =>
+    op.op === 'ref' && matches(op.ref.commitId)
+      ? Object.freeze({
+          op: 'ref' as const,
+          path: op.path,
+          ref: Object.freeze({ commitId: replacement, path: op.ref.path }),
+        })
+      : op,
+  )
+  return cloneDiff(ops)
+}
+
+/**
+ * Convert a materialized stored diff back into its canonical hash form.
+ *
+ * Every `op.ref.commitId === nodeId` is the materialized form of a self
+ * reference; it is replaced by {@link SELF_COMMIT} so that
+ * `hashCommit(parentId, message, dehydrateSelfRefs(nodeId, diff))` reproduces
+ * the node's original id. Use this for export, integrity checks and hash
+ * recomputation; never persist the dehydrated form.
+ *
+ * @param nodeId Actual id of the commit whose diff is being dehydrated.
+ * @param diff Materialized diff (may already contain `SELF_COMMIT`, which is
+ * left untouched).
+ * @returns A frozen, canonical diff.
+ * @throws TypeError / world errors for an invalid `nodeId` or malformed diff.
+ */
+export function dehydrateSelfRefs(nodeId: CommitHash, diff: StateDiff): StateDiff {
+  if (!isCommitHash(nodeId)) {
+    throw new TypeError('nodeId must be a non-empty well-formed CommitHash')
+  }
+  return rewriteSelfRefs(diff, (commitId) => commitId === nodeId, SELF_COMMIT)
+}
+
+/**
+ * Materialize every {@link SELF_COMMIT} in a canonical input diff with the real
+ * id computed for the new node.
+ *
+ * The result is what `commit()` persists, holds in memory and returns through
+ * `getRef`/`getNode`/`deref`. Idempotent: already materialized refs and refs to
+ * other commits are unchanged. Acceptance is decided by {@link SELF_COMMIT}
+ * only, so a caller-provided `SELF_COMMIT` path is resolved atomically.
+ *
+ * @param nodeId Newly computed commit id.
+ * @param diff Already canonical input diff (validated by `cloneDiff`) that may
+ * contain `SELF_COMMIT`.
+ * @returns A frozen, canonical diff with `SELF_COMMIT` replaced by `nodeId`;
+ * the input is returned unchanged when it contains no self reference.
+ */
+export function materializeSelfRefs(nodeId: CommitHash, diff: StateDiff): StateDiff {
+  if (!isCommitHash(nodeId)) {
+    throw new TypeError('nodeId must be a non-empty well-formed CommitHash')
+  }
+  let hasSelfRef = false
+  for (const op of diff) {
+    if (op.op === 'ref' && op.ref.commitId === SELF_COMMIT) {
+      hasSelfRef = true
+      break
+    }
+  }
+  if (!hasSelfRef) return diff
+  // `diff` already owns frozen canonical operations. Changing only commit ids
+  // cannot affect ordering or prefix validity; retain unchanged payloads.
+  return Object.freeze(
+    diff.map((op) =>
+      op.op === 'ref' && op.ref.commitId === SELF_COMMIT
+        ? Object.freeze({
+            op: 'ref' as const,
+            path: op.path,
+            ref: Object.freeze({ commitId: nodeId, path: op.ref.path }),
+          })
+        : op,
+    ),
+  )
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               Commit hashing                              */
 /* -------------------------------------------------------------------------- */
 
 /**
  * Compute the content-addressed commit hash:
  * `COMMIT(parentId, message, canonicalDiffOrder)`.
+ *
+ * Self references are hashed in canonical form: an input `SELF_COMMIT` hashes
+ * as the literal `'$self'`. When recomputing the hash of an already stored node,
+ * pass its id as `selfId` so materialized `ref.commitId === selfId` entries are
+ * dehydrated first (equivalent to passing
+ * `dehydrateSelfRefs(selfId, diff)`).
  */
 export function hashCommit(
   parentId: Option<CommitHash>,
   message: Value,
   diff: StateDiff,
+  selfId?: CommitHash,
 ): CommitHash {
   if (typeof parentId !== 'object' || parentId === null) {
     throw new TypeError('parentId must be an Option<CommitHash>')
@@ -576,7 +710,10 @@ export function hashCommit(
     throw new TypeError("parentId.kind must be 'some' or 'none'")
   }
 
-  const canonicalDiff = cloneDiff(diff)
+  if (selfId !== undefined && !isCommitHash(selfId)) {
+    throw new TypeError('selfId must be a non-empty well-formed CommitHash')
+  }
+  const canonicalDiff = selfId === undefined ? cloneDiff(diff) : dehydrateSelfRefs(selfId, diff)
   const canonicalMessage = cloneValue(message)
 
   const hasher = new BinaryHasher()
@@ -705,11 +842,14 @@ export function decodeStoredValue(type: unknown, raw: unknown, storageClass?: un
         throw new InvariantError('corrupted stored value: bytes raw value must be a BLOB')
       }
       return new Uint8Array(raw)
-    default:
+    default: {
       if (!(raw instanceof Uint8Array)) {
         throw new InvariantError('corrupted stored value: list raw value must be a BLOB')
       }
-      return decodeScalarList(raw)
+      const value = decodeValue(raw)
+      if (!Array.isArray(value)) corrupt('corrupted stored list: expected tag 0x06')
+      return value
+    }
   }
 }
 
@@ -718,98 +858,107 @@ function corrupt(message: string, cause?: unknown): never {
   throw new InvariantError(message, { cause })
 }
 
-function decodeScalarList(bytes: Uint8Array): Value {
-  if (bytes.byteLength < 5) {
-    corrupt('corrupted stored list: missing tag or element count')
-  }
-  if (bytes[0] !== 0x06) {
-    corrupt(`corrupted stored list: expected tag 0x06, got 0x${bytes[0]!.toString(16)}`)
-  }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  const count = view.getUint32(1, false)
-  const items: ScalarValue[] = []
-  let cursor = 5
+interface ValueCursor {
+  readonly bytes: Uint8Array
+  readonly view: DataView
+  offset: number
+}
 
-  for (let i = 0; i < count; i++) {
-    if (cursor >= bytes.byteLength) {
-      corrupt('corrupted stored list: truncated element')
-    }
-    const tag = bytes[cursor]!
-    cursor += 1
-    switch (tag) {
-      case 0x01:
-        items.push(null)
-        break
-      case 0x02: {
-        if (cursor >= bytes.byteLength) {
-          corrupt('corrupted stored list: truncated boolean')
-        }
-        const encoded = bytes[cursor]!
-        cursor += 1
-        if (encoded === 0x00) items.push(false)
-        else if (encoded === 0x01) items.push(true)
-        else corrupt(`corrupted stored list: invalid boolean byte 0x${encoded.toString(16)}`)
-        break
-      }
-      case 0x03: {
-        if (cursor + 8 > bytes.byteLength) {
-          corrupt('corrupted stored list: truncated number')
-        }
-        const number = view.getFloat64(cursor, false)
-        cursor += 8
-        if (!Number.isFinite(number)) {
-          corrupt('corrupted stored list: non-finite number')
-        }
-        items.push(number === 0 ? 0 : number)
-        break
-      }
-      case 0x04: {
-        if (cursor + 4 > bytes.byteLength) {
-          corrupt('corrupted stored list: truncated string length')
-        }
-        const length = view.getUint32(cursor, false)
-        cursor += 4
-        if (length > bytes.byteLength - cursor) {
-          corrupt('corrupted stored list: truncated string payload')
-        }
-        const payload = bytes.subarray(cursor, cursor + length)
-        cursor += length
-        let decoded: string
-        try {
-          decoded = utf8Decoder.decode(payload)
-        } catch (error) {
-          throw new InvariantError('corrupted stored list: invalid UTF-8 string payload', {
-            cause: error,
-          })
-        }
-        if (!decoded.isWellFormed()) {
-          corrupt('corrupted stored list: string is not well-formed Unicode')
-        }
-        items.push(decoded)
-        break
-      }
-      case 0x05: {
-        if (cursor + 4 > bytes.byteLength) {
-          corrupt('corrupted stored list: truncated bytes length')
-        }
-        const length = view.getUint32(cursor, false)
-        cursor += 4
-        if (length > bytes.byteLength - cursor) {
-          corrupt('corrupted stored list: truncated bytes payload')
-        }
-        items.push(new Uint8Array(bytes.subarray(cursor, cursor + length)))
-        cursor += length
-        break
-      }
-      default:
-        corrupt(`corrupted stored list: unknown scalar tag 0x${tag.toString(16)}`)
-    }
-  }
+function readUint32(cursor: ValueCursor, label: string): number {
+  if (cursor.offset + 4 > cursor.bytes.byteLength) corrupt(`corrupted value: truncated ${label}`)
+  const value = cursor.view.getUint32(cursor.offset, false)
+  cursor.offset += 4
+  return value
+}
 
-  if (cursor !== bytes.byteLength) {
-    corrupt('corrupted stored list: trailing bytes after elements')
+function readScalarWithTag(cursor: ValueCursor, tag: number): ScalarValue {
+  switch (tag) {
+    case 0x01:
+      return null
+    case 0x02: {
+      if (cursor.offset >= cursor.bytes.byteLength) corrupt('corrupted value: truncated boolean')
+      const encoded = cursor.bytes[cursor.offset]!
+      cursor.offset += 1
+      if (encoded === 0x00) return false
+      if (encoded === 0x01) return true
+      throw new InvariantError(`corrupted value: invalid boolean byte 0x${encoded.toString(16)}`)
+    }
+    case 0x03: {
+      if (cursor.offset + 8 > cursor.bytes.byteLength) corrupt('corrupted value: truncated number')
+      const number = cursor.view.getFloat64(cursor.offset, false)
+      cursor.offset += 8
+      if (!Number.isFinite(number)) corrupt('corrupted value: non-finite number')
+      return number === 0 ? 0 : number
+    }
+    case 0x04: {
+      const length = readUint32(cursor, 'string length')
+      if (length > cursor.bytes.byteLength - cursor.offset)
+        corrupt('corrupted value: truncated string payload')
+      const payload = cursor.bytes.subarray(cursor.offset, cursor.offset + length)
+      cursor.offset += length
+      let decoded: string
+      try {
+        decoded = utf8Decoder.decode(payload)
+      } catch (error) {
+        throw new InvariantError('corrupted value: invalid UTF-8 string payload', { cause: error })
+      }
+      if (!decoded.isWellFormed()) corrupt('corrupted value: string is not well-formed Unicode')
+      return decoded
+    }
+    case 0x05: {
+      const length = readUint32(cursor, 'bytes length')
+      if (length > cursor.bytes.byteLength - cursor.offset)
+        corrupt('corrupted value: truncated bytes payload')
+      const payload = new Uint8Array(cursor.bytes.subarray(cursor.offset, cursor.offset + length))
+      cursor.offset += length
+      return payload
+    }
+    default:
+      throw new InvariantError(`corrupted value: unknown scalar tag 0x${tag.toString(16)}`)
   }
-  return Object.freeze(items)
+}
+
+function readScalar(cursor: ValueCursor): ScalarValue {
+  if (cursor.offset >= cursor.bytes.byteLength) corrupt('corrupted value: missing scalar tag')
+  const tag = cursor.bytes[cursor.offset]!
+  cursor.offset += 1
+  if (tag === 0x06) corrupt('corrupted value: nested scalar lists are not allowed')
+  return readScalarWithTag(cursor, tag)
+}
+
+/**
+ * Decode canonical bytes produced by {@link encodeValue}.
+ *
+ * Accepts exactly one scalar or scalar-list value and rejects every malformed
+ * shape (truncation, trailing bytes, unknown tags, nested lists, non-finite
+ * numbers, malformed UTF-8 or lone surrogates) instead of coercing. Returned
+ * lists are frozen and byte payloads are independent copies.
+ *
+ * @throws {InvariantError} when `bytes` is not canonical world value encoding.
+ */
+export function decodeValue(bytes: Uint8Array): Value {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new TypeError('decodeValue expects a Uint8Array')
+  }
+  const cursor: ValueCursor = {
+    bytes,
+    view: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    offset: 0,
+  }
+  if (bytes.byteLength === 0) corrupt('corrupted value: missing value tag')
+  const tag = bytes[cursor.offset]!
+  cursor.offset += 1
+  let value: Value
+  if (tag === 0x06) {
+    const count = readUint32(cursor, 'element count')
+    const items: ScalarValue[] = []
+    for (let i = 0; i < count; i++) items.push(readScalar(cursor))
+    value = Object.freeze(items)
+  } else {
+    value = readScalarWithTag(cursor, tag)
+  }
+  if (cursor.offset !== bytes.byteLength) corrupt('corrupted value: trailing bytes after value')
+  return value
 }
 
 /* -------------------------------------------------------------------------- */

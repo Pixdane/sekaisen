@@ -1,4 +1,5 @@
 import type { Path, StateRef, Value } from '@sekaisen/plugin-world'
+import { encodeLinkTraits } from './links.ts'
 import type {
   ContainerPresence,
   DefaultStructPresence,
@@ -6,12 +7,14 @@ import type {
   LeafPresence,
   LeafValueKind,
   LeafValueTypeMap,
+  LinkTraits,
   MapBuilder,
   SchemaBuilders,
   SchemaError,
   SchemaFieldsOf,
   SchemaMetaMap,
   SchemaNode,
+  SchemaNodeMeta,
   SchemaNodeOf,
   StructBuilder,
 } from './types.ts'
@@ -506,10 +509,17 @@ function cloneNode(node: SchemaNode, path: Path, seen: Set<object>): SchemaNode 
 
 const EMPTY_META: SchemaMetaMap = Object.freeze(Object.create(null) as Record<string, Value>)
 
-function mergeMetadata(base: SchemaMetaMap, extra: SchemaMetaMap): SchemaMetaMap {
+function mergeMetadata(base: SchemaMetaMap, extra: SchemaNodeMeta): SchemaMetaMap {
   const out: Record<string, Value> = Object.create(null)
   for (const [key, value] of Object.entries(base)) out[key] = value
-  for (const [key, value] of Object.entries(cloneSchemaMetadata(extra))) out[key] = value
+  // `undefined` means "leave unchanged"; only present values are persisted.
+  for (const [key, value] of Object.entries(extra)) {
+    if (value === undefined) continue
+    if (typeof key !== 'string' || key.length === 0 || !key.isWellFormed()) {
+      failValidation([], 'type_mismatch', 'metadata keys must be non-empty well-formed strings')
+    }
+    out[key] = cloneSchemaValue(value)
+  }
   return Object.freeze(out)
 }
 
@@ -584,7 +594,7 @@ class LeafBuilderImpl<
     )
   }
 
-  meta(meta: SchemaMetaMap): LeafBuilder<TKind, TPresence> {
+  meta(meta: SchemaNodeMeta): LeafBuilder<TKind, TPresence> {
     return new LeafBuilderImpl<TKind, TPresence>(
       this.valueKind,
       this.presence,
@@ -652,7 +662,7 @@ class StructBuilderImpl<
     )
   }
 
-  meta(meta: SchemaMetaMap): StructBuilder<TFields, TAllowCustom, TPresence> {
+  meta(meta: SchemaNodeMeta): StructBuilder<TFields, TAllowCustom, TPresence> {
     return new StructBuilderImpl<TFields, TAllowCustom, TPresence>(
       this.fields,
       this.allowCustom,
@@ -705,7 +715,7 @@ class MapBuilderImpl<
     )
   }
 
-  meta(meta: SchemaMetaMap): MapBuilder<TValueSchema, TPresence> {
+  meta(meta: SchemaNodeMeta): MapBuilder<TValueSchema, TPresence> {
     return new MapBuilderImpl<TValueSchema, TPresence>(
       this.valueSchema,
       this.presence,
@@ -726,6 +736,12 @@ export const s: SchemaBuilders = Object.freeze({
   str: () => makeLeaf('str'),
   bytes: () => makeLeaf('bytes'),
   ref: () => makeLeaf('ref'),
+  link(traits: LinkTraits): LeafBuilder<'str'> {
+    return makeLeaf('str').meta(encodeLinkTraits(traits))
+  },
+  linkList(traits: LinkTraits): LeafBuilder<'list:str'> {
+    return makeLeaf('list:str').meta(encodeLinkTraits(traits))
+  },
   list<TItem extends 'bool' | 'num' | 'str' | 'bytes'>(
     itemKind: TItem,
   ): LeafBuilder<`list:${TItem}`> {
