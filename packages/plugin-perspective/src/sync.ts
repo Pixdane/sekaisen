@@ -13,6 +13,7 @@ import type { SchemaTransaction, StructLens } from '@sekaisen/plugin-schema'
 import type { Path, StateRef } from '@sekaisen/plugin-world'
 import { encodePathKey, SELF_COMMIT } from '@sekaisen/plugin-world'
 import { isDirectPersonalObservation } from './claims.ts'
+import { isGlobalSurfaceField } from './global-surface.ts'
 import { PerspectiveGraph as Graph } from './graph.ts'
 import { attemptPerspective } from './internal.ts'
 import type { PerspectiveReader } from './reader.ts'
@@ -41,6 +42,9 @@ import { isEphemeralSpec } from './visibility.ts'
  *
  * For every winning `direct_scope` field:
  * - ephemeral fields are never persisted;
+ * - declared `globalSurface` fields are omitted: they are live data feeds
+ *   re-read from the projection commit on every read, so persisting a
+ *   snapshot here would only manufacture stale observations;
  * - `'passive'` fields are skipped unless the field or its instance appears
  *   in `focusedPaths`;
  * - `coWitnesses` enumerate every observer body in the observer's complete
@@ -141,6 +145,12 @@ export function syncScope(
           if (field.value.kind === 'none') continue
           if (graph.fieldVisibility(field) !== 'surface') continue
           if (isEphemeralSpec(field.spec)) continue
+          /*
+           * Global feeds are read live from whatever commit a projection is
+           * bound to. Persisting one here would freeze a snapshot that later
+           * shadows the actual clock, so sync never writes them.
+           */
+          if (isGlobalSurfaceField(graph, instance.value, field)) continue
           const channel = field.spec.metadata.sense === 'sound' ? 'sound' : 'sight'
           const channelScope = channel === 'sight' ? scope.sight : scope.sound
           if (!channelScope.reachablePaths.has(encodePathKey(instancePath))) continue

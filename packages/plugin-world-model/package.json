@@ -1,0 +1,17 @@
+{
+  "name": "@sekaisen/plugin-world-model",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "exports": "./src/index.ts",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@sekaisen/core": "workspace:*",
+    "@sekaisen/plugin-perspective": "workspace:*",
+    "@sekaisen/plugin-schema": "workspace:*",
+    "@sekaisen/plugin-world": "workspace:*",
+    "cordis": "4.0.0-rc.11"
+  }
+}

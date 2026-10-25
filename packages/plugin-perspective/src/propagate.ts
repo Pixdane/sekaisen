@@ -14,6 +14,7 @@ import type { Path, StateRef } from '@sekaisen/plugin-world'
 import { encodePathKey, encodeValue, SELF_COMMIT } from '@sekaisen/plugin-world'
 import { assertRetellableFacet, retellsEntity } from './claim-policy.ts'
 import type { ClaimEvaluator, FoldFacet } from './claims.ts'
+import { globalSurfaceCandidate } from './global-surface.ts'
 import type { PerspectiveGraph } from './graph.ts'
 import { fieldInstancePath, PerspectiveGraph as Graph, pathsEqual } from './graph.ts'
 import { attemptPerspective, fail } from './internal.ts'
@@ -175,6 +176,11 @@ function subjectiveTop(
       pathsEqual(candidate.path, path),
     )
     if (field && field.value.kind === 'some') {
+      const global = globalSurfaceCandidate(graph, observer.entity, instance.value, field)
+      if (global.kind === 'some') {
+        const fold = evaluator.fold(path, global.value)
+        return fold.primary.kind === 'some' ? some(toSubjective(fold.primary.value, path)) : NONE
+      }
       const owned = ownsEntity(graph, observer, instance.value.path)
       const visibility = graph.fieldVisibility(field)
       const surface = visibility === 'surface'

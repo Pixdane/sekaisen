@@ -12,7 +12,7 @@ import { SchemaFailure } from './builders.ts'
 import { checkDrift, migrateState } from './evolution.ts'
 import type { SchemaHistory } from './history.ts'
 import { validateStateLinks } from './links.ts'
-import { encodeMessage } from './message.ts'
+import { decodeMessage, encodeMessage } from './message.ts'
 import { DraftOverlay } from './overlay.ts'
 import type { SchemaRegistry } from './registry.ts'
 import type { Catalog } from './runtime.ts'
@@ -218,7 +218,16 @@ export class SchemaCommitter {
           ),
         ),
       )
-      const result = validator({ parentId, draft: view, diff: exposedDiff })
+      const candidateMessage =
+        typeof message === 'string'
+          ? Object.freeze({ kind: '$text', data: message })
+          : decodeMessage(message as Uint8Array, (kind) => catalog.messages.get(kind))
+      const result = validator({
+        parentId,
+        draft: view,
+        diff: exposedDiff,
+        message: candidateMessage,
+      })
       if (!result.ok) throw new SchemaFailure({ kind: 'validator_rejected', ...result.error })
     }
     const node = worldResult(

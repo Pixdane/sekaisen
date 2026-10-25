@@ -42,9 +42,39 @@ export interface LiveFacetInput {
   readonly coWitnesses?: readonly string[]
 }
 
+/** Persisted table that owns a contributing claim record. */
+export type ClaimContributorTable = 'observedClaims' | 'discoveredEntities' | 'rumorClaims'
+
+/**
+ * Internal identity of one stored record merged into a surviving facet.
+ *
+ * A same-origin fold collapses several records into the newest facet while
+ * aggregating sources and co-witnesses. Consumers that migrate provenance (for
+ * example `carryOver`) need every original contributor, not only `recordKey`.
+ * Live perception has no persisted contributor.
+ */
+export interface ClaimContributor {
+  readonly perspectiveId: string
+  readonly table: ClaimContributorTable
+  readonly recordKey: string
+}
+
 /** One folded facet. */
 export interface FoldFacet {
   readonly sourceKind: PerceptionSourceKind
+  /**
+   * Owning perspective of a persisted observed/rumor record, used to
+   * disambiguate equal record keys inherited from different minds. Live
+   * facets have no stored owner and omit it.
+   */
+  readonly perspectiveId?: string
+  /**
+   * Consumer-visible subjective sequence:
+   * - persisted claims/memories: their stored positive `seq`;
+   * - live perception: the observer perspective's current `nextSeq`.
+   * The internal fold sentinel `0` is never exposed here.
+   */
+  readonly seq: number
   readonly priority: number
   readonly belief: BeliefState
   readonly source: Option<string>
@@ -61,6 +91,11 @@ export interface FoldFacet {
   readonly encodedValue?: Uint8Array
   /** Stable identifier of the winning record, for caches and corpus metadata. */
   readonly recordKey: string
+  /**
+   * Internal identities of every persisted record merged into this facet, in
+   * fold order. The newest record is last. Live facets omit it.
+   */
+  readonly contributors?: readonly ClaimContributor[]
 }
 
 /** Fold output. `primary` is the top surviving facet. */
@@ -89,6 +124,7 @@ interface LiveItem {
 
 interface ObservedItem {
   readonly kind: 'observed'
+  readonly perspectiveId: string
   readonly priority: number
   readonly rank: number
   readonly seq: number
@@ -101,6 +137,7 @@ interface ObservedItem {
 
 interface RumorItem {
   readonly kind: 'rumor'
+  readonly perspectiveId: string
   readonly priority: number
   readonly rank: number
   readonly seq: number
@@ -122,6 +159,8 @@ type ClaimItem = LiveItem | ObservedItem | RumorItem | ExclusionItem
 
 interface MutableFacet {
   sourceKind: PerceptionSourceKind
+  perspectiveId?: string
+  seq: number
   priority: number
   belief: BeliefState
   source: Option<string>
@@ -136,6 +175,7 @@ interface MutableFacet {
   summary: Option<string>
   encodedValue?: Uint8Array
   recordKey: string
+  contributors: ClaimContributor[]
 }
 
 /** Encoded key of the root path `[]`, which prefixes every folded path. */
@@ -159,6 +199,20 @@ function stateRefEquals(a: StateRef, b: StateRef): boolean {
 
 function appendUnique(target: string[], values: readonly string[]): void {
   for (const value of values) if (!target.includes(value)) target.push(value)
+}
+
+function contributorKey(contributor: ClaimContributor): string {
+  return `${contributor.perspectiveId}\u0000${contributor.table}\u0000${contributor.recordKey}`
+}
+
+function appendContributors(target: ClaimContributor[], values: readonly ClaimContributor[]): void {
+  const seen = new Set(target.map(contributorKey))
+  for (const value of values) {
+    const key = contributorKey(value)
+    if (seen.has(key)) continue
+    seen.add(key)
+    target.push(value)
+  }
 }
 
 /**
@@ -268,6 +322,45 @@ export class ClaimEvaluator {
     return this.inheritance().order.length
   }
 
+  /**
+   * Consumer-visible subjective sequence of the observer's live perspective.
+   *
+   * Live perception is not a stored claim, so it exposes the perspective's
+   * current `nextSeq` (a positive integer). The internal fold sentinel `0`
+   * remains private to ordering.
+   */
+  nextSeq(): number {
+    const value = this.perspectives.get(this.rootId)?.nextSeq ?? 1
+    return Number.isFinite(value) && value >= 1 ? Math.trunc(value) : 1
+  }
+
+  /**
+   * Whether inherited or personal prefix exclusions suppress non-claim content
+   * (cognitive memories) at `path`.
+   *
+   * A stored memory behaves like a facet of its own `priority`: an exclusion
+   * removes facets with priority `<= exclusion.priority`, so a covering
+   * exclusion with a higher or equal priority hides the memory. Exclusions are
+   * never overridden, matching claim folding.
+   *
+   * @param path - Memory instance or field path.
+   * @param priority - The memory's effective priority.
+   * @returns True when the content must not be exposed.
+   */
+  suppressed(path: Path, priority: number): boolean {
+    const key = encodePathKey(path)
+    for (const id of this.inheritance().order) {
+      const record = this.perspectives.get(id)
+      if (record === undefined) continue
+      for (const exclusion of record.exclusions.values()) {
+        if (exclusion.priority < priority) continue
+        // Validated length-prefixed keys match whole segments, including [].
+        if (key.startsWith(exclusion.targetPathKey)) return true
+      }
+    }
+    return false
+  }
+
   private collectItems(path: Path, live: LiveFacetInput | undefined): readonly ClaimItem[] {
     const { order, ranks } = this.inheritance()
     const items: ClaimItem[] = []
@@ -286,6 +379,7 @@ export class ClaimEvaluator {
         if (!samePath(claim.targetRef.path, path)) continue
         items.push({
           kind: 'observed',
+          perspectiveId: id,
           priority: claim.priority,
           rank,
           seq: claim.seq,
@@ -300,6 +394,7 @@ export class ClaimEvaluator {
         if (!samePath(claim.targetRef.path, path)) continue
         items.push({
           kind: 'observed',
+          perspectiveId: id,
           priority: claim.priority,
           rank,
           seq: claim.seq,
@@ -314,6 +409,7 @@ export class ClaimEvaluator {
         if (claim.targetPathKey !== pathKey) continue
         items.push({
           kind: 'rumor',
+          perspectiveId: id,
           priority: claim.priority,
           rank,
           seq: claim.seq,
@@ -351,6 +447,7 @@ export class ClaimEvaluator {
     if (item.kind === 'live') {
       return {
         sourceKind: item.facet.kind,
+        seq: this.nextSeq(),
         priority: item.priority,
         belief: 'believed',
         source: NONE,
@@ -364,12 +461,15 @@ export class ClaimEvaluator {
         value: item.facet.value,
         summary: item.facet.summary,
         recordKey: 'live',
+        contributors: [],
       }
     }
     if (item.kind === 'rumor') {
       const source = item.record.source
       return {
         sourceKind: 'rumor_claim',
+        perspectiveId: item.perspectiveId,
+        seq: item.record.seq,
         priority: item.priority,
         belief: item.belief,
         source,
@@ -384,6 +484,13 @@ export class ClaimEvaluator {
         summary: item.record.rumorSummary,
         encodedValue: new Uint8Array(item.record.encodedValue),
         recordKey: item.record.key,
+        contributors: [
+          {
+            perspectiveId: item.perspectiveId,
+            table: 'rumorClaims',
+            recordKey: item.record.key,
+          },
+        ],
       }
     }
     const resolved = item.discovered ? NONE : this.resolve(item.record.targetRef)
@@ -391,6 +498,8 @@ export class ClaimEvaluator {
     const source = item.record.source
     return {
       sourceKind: 'observed_claim',
+      perspectiveId: item.perspectiveId,
+      seq: item.record.seq,
       priority: item.priority,
       belief: item.belief,
       source,
@@ -404,6 +513,13 @@ export class ClaimEvaluator {
       value: resolved.kind === 'some' ? resolved.value.value : null,
       summary: resolved.kind === 'some' ? resolved.value.summary : NONE,
       recordKey: item.record.key,
+      contributors: [
+        {
+          perspectiveId: item.perspectiveId,
+          table: item.discovered ? 'discoveredEntities' : 'observedClaims',
+          recordKey: item.record.key,
+        },
+      ],
     }
   }
 
@@ -419,6 +535,7 @@ export class ClaimEvaluator {
       if (next === undefined) continue
       const mergedSources: string[] = []
       const mergedCoWitnesses: string[] = []
+      const mergedContributors: ClaimContributor[] = []
       const sameOrigin: MutableFacet[] = []
       const nextOrigin = next.originEventRef
       for (const facet of facets) {
@@ -434,23 +551,31 @@ export class ClaimEvaluator {
         sameOrigin.push(facet)
         appendUnique(mergedSources, facet.sources)
         appendUnique(mergedCoWitnesses, facet.coWitnesses)
+        appendContributors(mergedContributors, facet.contributors ?? [])
       }
       if (sameOrigin.length > 0) {
         appendUnique(mergedSources, next.sources)
         appendUnique(mergedCoWitnesses, next.coWitnesses)
+        appendContributors(mergedContributors, next.contributors)
         for (const facet of sameOrigin) {
           const index = facets.indexOf(facet)
           if (index >= 0) facets.splice(index, 1)
         }
         next.sources = mergedSources
         next.coWitnesses = mergedCoWitnesses
+        next.contributors = mergedContributors
       }
       if (item.override)
         for (let i = facets.length - 1; i >= 0; i--)
           if (facets[i]!.priority <= item.priority) facets.splice(i, 1)
       facets.push(next)
     }
-    const frozen = facets.map((facet) => Object.freeze({ ...facet }))
+    const frozen = facets.map((facet) =>
+      Object.freeze({
+        ...facet,
+        contributors: Object.freeze([...facet.contributors]),
+      }),
+    )
     return Object.freeze({
       facets: Object.freeze(frozen),
       primary: frozen.length > 0 ? some(frozen[frozen.length - 1]!) : NONE,

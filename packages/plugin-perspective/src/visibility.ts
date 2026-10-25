@@ -96,6 +96,19 @@ declare module '@sekaisen/plugin-schema' {
      * same root mind (for example injuries or base reaction speed).
      */
     readonly sharedAcrossDelegates?: boolean
+    /**
+     * Explicit opt-in for a declared live global data feed.
+     *
+     * Honored only on a leaf field of a registered struct **root** (never on
+     * Map members, nested instances or instances that merely look global).
+     * The value is then read from the current projection commit for every
+     * staged physical observer, without requiring the root to be inside that
+     * observer's geometric sensory scope. Effective instance and field
+     * visibility, staged-body gating and the observer's normal claim/exclusion
+     * fold still apply. This is not photon visibility: it grants no ownership,
+     * navigation, link-target identity, discovery or memory write.
+     */
+    readonly globalSurface?: boolean
   }
 }
 
@@ -188,6 +201,16 @@ export function salienceOfSpec(spec: SchemaNode | undefined): FieldSalience {
 /** True when a leaf was declared `ephemeral: true` (never persisted as a claim). */
 export function isEphemeralSpec(spec: SchemaNode | undefined): boolean {
   return spec?.metadata.ephemeral === true
+}
+
+/**
+ * True when a leaf was explicitly declared `globalSurface: true`.
+ *
+ * Declaration-only by design: a runtime `$meta` override can hide a global
+ * feed through ordinary visibility, but can never opt an undeclared leaf in.
+ */
+export function isGlobalSurfaceSpec(spec: SchemaNode | undefined): boolean {
+  return spec?.metadata.globalSurface === true
 }
 
 /** True when a leaf was declared `sharedAcrossDelegates: true`. */

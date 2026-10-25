@@ -15,6 +15,7 @@ import { PerspectiveGraph as Graph } from './graph.ts'
 import { expectSchema, fail } from './internal.ts'
 import { fieldLensAt, structLensAt } from './lenses.ts'
 import type {
+  CognitiveMemoryInput,
   ExclusionClaimInput,
   ObservedClaimInput,
   PerspectiveRecord,
@@ -62,6 +63,7 @@ export function ensurePerspective(
     observedClaims: {},
     rumorClaims: {},
     exclusions: {},
+    memories: {},
   }
   if (hostEntity.kind === 'some') input.hostEntity = encodePathKey(hostEntity.value)
   tx.set(map.value, { ...entries, [id]: input })
@@ -100,4 +102,37 @@ export function appendClaim(
 /** Advance the per-perspective write sequence. */
 export function bumpSeq(tx: SchemaTransaction, id: string, next: number): void {
   tx.set(fieldLensAt(tx, [...PERSPECTIVES_ROOT, id, 'nextSeq']), next)
+}
+
+/**
+ * Create one cognitive memory entry.
+ *
+ * The Map entry lens is optional, so this creates or replaces exactly the
+ * requested id. Callers reject id collisions before writing; the whole memory
+ * command runs inside one transaction savepoint.
+ */
+export function writeMemory(
+  tx: SchemaTransaction,
+  perspectiveId: string,
+  memoryId: string,
+  input: CognitiveMemoryInput,
+): void {
+  const lens = structLensAt(tx, [...PERSPECTIVES_ROOT, perspectiveId, 'memories', memoryId])
+  tx.set(lens, input)
+}
+
+/**
+ * Patch mutable memory fields without resetting unspecified fields.
+ *
+ * `content` leaf metadata (the micro-summary) is written separately through
+ * `setWithMeta`; this helper covers the struct's ordinary leaves and links.
+ */
+export function patchMemory(
+  tx: SchemaTransaction,
+  perspectiveId: string,
+  memoryId: string,
+  patch: Record<string, unknown>,
+): void {
+  const lens = structLensAt(tx, [...PERSPECTIVES_ROOT, perspectiveId, 'memories', memoryId])
+  tx.patch(lens, patch)
 }

@@ -650,3 +650,47 @@ test('caller buffers and validator diff buffers cannot mutate the validated comm
   )
   expect(unwrap(schema.get(committed.id, data))).toEqual(some(new Uint8Array([2])))
 })
+
+test('message-dependent validators reject without publishing and cannot change other validators payloads', () => {
+  const { schema, world } = setup()
+  const balance = unwrap(schema.define(['balance'], s.num().default(0)))
+  const payment = unwrap(
+    schema.defineMessage('payment', s.struct({ approved: s.bool(), receipt: s.bytes() })),
+  )
+  const initial = unwrap(schema.commit({ head: 'main', message: 'initial' }))
+  schema.addCommitValidator(({ message }) => {
+    if (message.kind === 'payment') {
+      const payload = message.data as { approved: boolean; receipt: Uint8Array }
+      payload.receipt[0] = 99
+    }
+    return ok(undefined)
+  })
+  schema.addCommitValidator(({ message }) => {
+    if (message.kind !== 'payment') return ok(undefined)
+    const payload = message.data as { approved: boolean; receipt: Uint8Array }
+    return payload.approved && payload.receipt[0] === 7
+      ? ok(undefined)
+      : err({ path: balance.path, validatorName: 'payment', reason: 'unapproved_payment' })
+  })
+  const rejected = schema.commit(
+    { head: 'main', message: payment.create({ approved: false, receipt: new Uint8Array([7]) }) },
+    (tx) => tx.set(balance, 100),
+  )
+  expect(rejected).toMatchObject({
+    ok: false,
+    error: { kind: 'validator_rejected', reason: 'unapproved_payment' },
+  })
+  expect(world.getHead('main')).toEqual(some(initial.id))
+  expect(unwrap(schema.get(initial.id, balance))).toEqual(some(0))
+  const accepted = unwrap(
+    schema.commit(
+      { head: 'main', message: payment.create({ approved: true, receipt: new Uint8Array([7]) }) },
+      (tx) => tx.set(balance, 100),
+    ),
+  )
+  expect(unwrap(schema.get(accepted.id, balance))).toEqual(some(100))
+  expect(unwrap(schema.getMessage(accepted.id))).toMatchObject({
+    kind: 'payment',
+    data: { approved: true, receipt: new Uint8Array([7]) },
+  })
+})

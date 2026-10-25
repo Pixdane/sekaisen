@@ -31,12 +31,25 @@ import type { Path, StateRef, Value } from '@sekaisen/plugin-world'
 import { decodePathKey, encodePathKey } from '@sekaisen/plugin-world'
 import { expectSchema } from './internal.ts'
 import type {
+  CognitiveMemoryRecord,
+  CognitiveMemoryRelatedEntityRecord,
   ExclusionClaimRecord,
+  MemoryEventOrigin,
+  MemoryLevel,
+  MemorySignificance,
+  MemoryTier,
   ObservedClaimRecord,
   PerspectiveRecord,
   RumorClaimRecord,
 } from './schemas.ts'
-import { DEFAULT_PERSPECTIVE_PRIORITY, PERSPECTIVES_ROOT } from './schemas.ts'
+import {
+  DEFAULT_PERSPECTIVE_PRIORITY,
+  MEMORY_EVENT_ORIGINS,
+  MEMORY_LEVELS,
+  MEMORY_SIGNIFICANCES,
+  MEMORY_TIERS,
+  PERSPECTIVES_ROOT,
+} from './schemas.ts'
 import type { BeliefState } from './types.ts'
 import type {
   FieldSalience,
@@ -257,6 +270,137 @@ function claimMap<T>(
   return map
 }
 
+/** Pick a validated enum string or the declared fallback. */
+function enumField<T extends string>(
+  inspection: HistoricalStructInspection,
+  name: string,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  const value = stringField(inspection, name)
+  return value.kind === 'some' && (allowed as readonly string[]).includes(value.value)
+    ? (value.value as T)
+    : fallback
+}
+
+/** Optional finite numeric leaf. */
+function optionalNumberField(inspection: HistoricalStructInspection, name: string): Option<number> {
+  const leaf = leafOf(inspection, name)
+  return leaf?.nodeKind === 'leaf' && typeof leaf.value === 'number' && Number.isFinite(leaf.value)
+    ? some(leaf.value)
+    : NONE
+}
+
+function readRelatedEntities(
+  inspection: HistoricalStructInspection,
+): readonly CognitiveMemoryRelatedEntityRecord[] {
+  const child = leafOf(inspection, 'relatedEntities')
+  if (child?.nodeKind !== 'map') return Object.freeze([])
+  const records: CognitiveMemoryRelatedEntityRecord[] = []
+  for (const [slot, entry] of Object.entries(child.entries)) {
+    if (entry.nodeKind !== 'struct') continue
+    const targetRef = refField(entry, 'targetRef')
+    if (targetRef.kind === 'none') continue
+    const role = stringField(entry, 'role')
+    records.push(
+      Object.freeze({
+        slot,
+        targetRef: targetRef.value,
+        role: role.kind === 'some' ? role.value : 'participant',
+      }),
+    )
+  }
+  records.sort((a, b) => a.slot.localeCompare(b.slot))
+  return Object.freeze(records)
+}
+
+/**
+ * Decode one stored cognitive memory.
+ *
+ * Required references and the subjective content are the storage contract;
+ * structurally damaged records without them are skipped like malformed claim
+ * records. Enum and numeric fields fall back defensively for total reads; the
+ * final-draft validator rejects the underlying malformed draft before commit.
+ */
+export function readMemory(
+  memoryId: string,
+  inspection: HistoricalStructInspection,
+  perspectiveId: string,
+): CognitiveMemoryRecord | undefined {
+  const owner = stringField(inspection, 'ownerPerspectiveId')
+  const content = stringField(inspection, 'content')
+  const factEventRef = refField(inspection, 'factEventRef')
+  const factSnapshotRef = refField(inspection, 'factSnapshotRef')
+  const acquiredAtRef = refField(inspection, 'acquiredAtRef')
+  const originRef = refField(inspection, 'originRef')
+  if (
+    owner.kind === 'none' ||
+    content.kind === 'none' ||
+    factEventRef.kind === 'none' ||
+    factSnapshotRef.kind === 'none' ||
+    acquiredAtRef.kind === 'none' ||
+    originRef.kind === 'none'
+  )
+    return undefined
+  const contentLeaf = leafOf(inspection, 'content')
+  const rawSummary = contentLeaf?.nodeKind === 'leaf' ? contentLeaf.meta.summary : undefined
+  const children: Path[] = []
+  for (const key of stringListField(inspection, 'children')) {
+    const decoded = decodePathKeySafe(key)
+    if (decoded.kind === 'some') children.push(decoded.value)
+  }
+  return Object.freeze({
+    memoryId,
+    path: Object.freeze([...PERSPECTIVES_ROOT, perspectiveId, 'memories', memoryId]),
+    ownerPerspectiveId: owner.value,
+    seq: numberField(inspection, 'seq', 0),
+    level: enumField<MemoryLevel>(inspection, 'level', MEMORY_LEVELS, 'L0'),
+    eventOrigin: enumField<MemoryEventOrigin>(
+      inspection,
+      'eventOrigin',
+      MEMORY_EVENT_ORIGINS,
+      'scene',
+    ),
+    significance: enumField<MemorySignificance>(
+      inspection,
+      'significance',
+      MEMORY_SIGNIFICANCES,
+      'routine',
+    ),
+    tier: enumField<MemoryTier>(inspection, 'tier', MEMORY_TIERS, 'active'),
+    strength: numberField(inspection, 'strength', 1),
+    belief: beliefField(inspection, 'believed'),
+    priority: numberField(inspection, 'priority', 0),
+    startTime: optionalNumberField(inspection, 'startTime'),
+    endTime: optionalNumberField(inspection, 'endTime'),
+    content: content.value,
+    summary: typeof rawSummary === 'string' ? some(rawSummary) : NONE,
+    factEventRef: factEventRef.value,
+    factSnapshotRef: factSnapshotRef.value,
+    acquiredAtRef: acquiredAtRef.value,
+    originRef: originRef.value,
+    supportingClaimKeys: Object.freeze([...stringListField(inspection, 'supportingClaimKeys')]),
+    children: Object.freeze(children),
+    relatedEntities: readRelatedEntities(inspection),
+  })
+}
+
+/** Decode the `memories` sub-table with its owning perspective id for paths. */
+function memoryMap(
+  inspection: HistoricalStructInspection,
+  perspectiveId: string,
+): ReadonlyMap<string, CognitiveMemoryRecord> {
+  const child = leafOf(inspection, 'memories')
+  const map = new Map<string, CognitiveMemoryRecord>()
+  if (child?.nodeKind !== 'map') return map
+  for (const [key, entry] of Object.entries(child.entries)) {
+    if (entry.nodeKind !== 'struct') continue
+    const record = readMemory(key, entry, perspectiveId)
+    if (record) map.set(key, record)
+  }
+  return map
+}
+
 /** Build the empty perspective used when a mind has not been materialized yet. */
 export function emptyPerspective(id: string): PerspectiveRecord {
   return Object.freeze({
@@ -270,6 +414,7 @@ export function emptyPerspective(id: string): PerspectiveRecord {
     observedClaims: new Map(),
     rumorClaims: new Map(),
     exclusions: new Map(),
+    memories: new Map(),
   })
 }
 
@@ -331,6 +476,7 @@ export function readPerspective(
     observedClaims: claimMap(inspection, 'observedClaims', readObservedClaim),
     rumorClaims: claimMap(inspection, 'rumorClaims', readRumorClaim),
     exclusions: claimMap(inspection, 'exclusions', readExclusion),
+    memories: memoryMap(inspection, id),
   })
 }
 

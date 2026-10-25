@@ -17,12 +17,22 @@
 
 import type { Result } from '@sekaisen/core'
 import { err, ok } from '@sekaisen/core'
-import type { ReadonlySchemaView } from '@sekaisen/plugin-schema'
+import type { HistoricalStructInspection, ReadonlySchemaView } from '@sekaisen/plugin-schema'
 import type { Path } from '@sekaisen/plugin-world'
-import { decodePathKey, encodePathKey } from '@sekaisen/plugin-world'
+import { decodePathKey, encodePathKey, SELF_COMMIT } from '@sekaisen/plugin-world'
 import type { PerspectiveGraph } from './graph.ts'
-import { PerspectiveGraph as Graph } from './graph.ts'
-import { ALL_PERSPECTIVE_ID } from './schemas.ts'
+import { decodePathKeySafe, PerspectiveGraph as Graph } from './graph.ts'
+import { parseCognitiveMemoryPath } from './memory-topology.ts'
+import type { MemoryLevel } from './schemas.ts'
+import {
+  ALL_PERSPECTIVE_ID,
+  MEMORY_EVENT_ORIGINS,
+  MEMORY_LEVELS,
+  MEMORY_SIGNIFICANCES,
+  MEMORY_TIERS,
+  memoryLevelRank,
+  PERSPECTIVES_ROOT,
+} from './schemas.ts'
 import type { PerspectiveLinkRole } from './visibility.ts'
 import { hasLinkRole, isLinkSpec } from './visibility.ts'
 
@@ -145,6 +155,253 @@ function checkPerspectiveInheritance(graph: PerspectiveGraph): TopologyValidator
   return null
 }
 
+/** Raw stored leaf value for one declared field on any struct. */
+function rawLeafValue(graph: PerspectiveGraph, path: Path, name: string): unknown {
+  const instance = graph.instance(path)
+  if (instance.kind === 'none') return undefined
+  const field = instance.value.fields.get(name)
+  if (field === undefined || field.value.kind === 'none') return undefined
+  return field.value.value
+}
+
+/** Raw declared leaf on an already-inspected historical struct. */
+function structFieldValue(struct: HistoricalStructInspection, name: string): unknown {
+  const field = struct.fields[name]
+  if (field === undefined || field.kind === 'none') return undefined
+  const node = field.value
+  return node.nodeKind === 'leaf' ? node.value : undefined
+}
+
+function rawString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function rawNumber(value: unknown): number | undefined {
+  return typeof value === 'number' ? value : undefined
+}
+
+/** Every declared leaf of one memory record, read without Reader defaults. */
+interface RawMemoryFields {
+  readonly ownerPerspectiveId: unknown
+  readonly seq: unknown
+  readonly level: unknown
+  readonly eventOrigin: unknown
+  readonly significance: unknown
+  readonly tier: unknown
+  readonly strength: unknown
+  readonly belief: unknown
+  readonly priority: unknown
+  readonly startTime: unknown
+  readonly endTime: unknown
+  readonly content: unknown
+  readonly factEventRef: unknown
+  readonly factSnapshotRef: unknown
+  readonly acquiredAtRef: unknown
+  readonly originRef: unknown
+  readonly children: unknown
+}
+
+/** Read one memory's raw storage fields from an existing struct inspection. */
+function rawMemoryFields(struct: HistoricalStructInspection): RawMemoryFields {
+  const read = (name: string): unknown => structFieldValue(struct, name)
+  return {
+    ownerPerspectiveId: read('ownerPerspectiveId'),
+    seq: read('seq'),
+    level: read('level'),
+    eventOrigin: read('eventOrigin'),
+    significance: read('significance'),
+    tier: read('tier'),
+    strength: read('strength'),
+    belief: read('belief'),
+    priority: read('priority'),
+    startTime: read('startTime'),
+    endTime: read('endTime'),
+    content: read('content'),
+    factEventRef: read('factEventRef'),
+    factSnapshotRef: read('factSnapshotRef'),
+    acquiredAtRef: read('acquiredAtRef'),
+    originRef: read('originRef'),
+    children: read('children'),
+  }
+}
+
+/** Decode a stored `s.ref` value directly, without Reader coercion. */
+function rawStateRef(
+  value: unknown,
+): { readonly commitId: string; readonly path: readonly string[] } | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const candidate = value as Readonly<Record<string, unknown>>
+  const commitId = candidate.commitId
+  const refPath = candidate.path
+  if (typeof commitId !== 'string' || !Array.isArray(refPath)) return undefined
+  const segments: string[] = []
+  for (const segment of refPath) {
+    if (typeof segment !== 'string') return undefined
+    segments.push(segment)
+  }
+  return { commitId, path: Object.freeze(segments) }
+}
+
+/** Decode a raw list-of-str leaf, or `undefined` when it is malformed. */
+function rawStringList(value: unknown): readonly string[] | undefined {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) return undefined
+  const items: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') return undefined
+    items.push(item)
+  }
+  return Object.freeze(items)
+}
+
+/** Narrow a raw stored level to the declared enum, or `undefined`. */
+function rawMemoryLevel(value: string | undefined): MemoryLevel | undefined {
+  return value !== undefined && (MEMORY_LEVELS as readonly string[]).includes(value)
+    ? (value as MemoryLevel)
+    : undefined
+}
+
+/** Raw related-entity `targetRef` paths keyed by relation slot. */
+function rawRelatedEntityRefPaths(
+  struct: HistoricalStructInspection,
+): readonly (readonly string[])[] | undefined {
+  const field = struct.fields.relatedEntities
+  if (field === undefined || field.kind === 'none') return []
+  const node = field.value
+  if (node.nodeKind !== 'map') return undefined
+  const refPaths: (readonly string[])[] = []
+  for (const entry of Object.values(node.entries)) {
+    if (entry.nodeKind !== 'struct') return undefined
+    const targetRef = entry.fields.targetRef
+    if (targetRef === undefined || targetRef.kind === 'none') return undefined
+    const targetRefNode = targetRef.value
+    if (targetRefNode.nodeKind !== 'leaf') return undefined
+    const ref = rawStateRef(targetRefNode.value)
+    if (ref === undefined) return undefined
+    refPaths.push(ref.path)
+  }
+  return refPaths
+}
+
+/**
+ * Validate cognitive memory ownership, enums, metrics, references and the
+ * same-perspective summarisation hierarchy.
+ *
+ * Runs only on the final draft, so writing `memory.seq` before advancing
+ * `nextSeq` (or the reverse) inside one transaction remains legal.
+ */
+function checkCognitiveMemories(graph: PerspectiveGraph): TopologyValidatorFailure | null {
+  for (const [perspectiveId] of graph.perspectives()) {
+    const perspectivePath = [...PERSPECTIVES_ROOT, perspectiveId]
+    const nextSeq = rawNumber(rawLeafValue(graph, perspectivePath, 'nextSeq'))
+    if (nextSeq === undefined || !Number.isInteger(nextSeq) || nextSeq < 1)
+      return failure(perspectivePath, 'invalid_memory_metrics')
+    const memories = graph.inspect([...perspectivePath, 'memories'])
+    if (memories.kind === 'none' || memories.value.nodeKind !== 'map') continue
+    const records = new Map<
+      string,
+      {
+        readonly path: Path
+        readonly struct: HistoricalStructInspection
+        readonly fields: RawMemoryFields
+      }
+    >()
+    for (const [memoryId, entry] of Object.entries(memories.value.entries)) {
+      const path = [...perspectivePath, 'memories', memoryId]
+      if (entry.nodeKind !== 'struct') return failure(path, 'invalid_memory_metrics')
+      records.set(memoryId, { path, struct: entry, fields: rawMemoryFields(entry) })
+    }
+    for (const record of records.values()) {
+      const { path, struct, fields } = record
+      if (rawString(fields.ownerPerspectiveId) !== perspectiveId)
+        return failure(path, 'memory_owner_mismatch')
+      const level = rawMemoryLevel(rawString(fields.level))
+      const eventOrigin = rawString(fields.eventOrigin)
+      const significance = rawString(fields.significance)
+      const tier = rawString(fields.tier)
+      const belief = rawString(fields.belief)
+      const validEnums =
+        eventOrigin !== undefined &&
+        (MEMORY_EVENT_ORIGINS as readonly string[]).includes(eventOrigin) &&
+        significance !== undefined &&
+        (MEMORY_SIGNIFICANCES as readonly string[]).includes(significance) &&
+        tier !== undefined &&
+        (MEMORY_TIERS as readonly string[]).includes(tier) &&
+        (belief === 'believed' || belief === 'suspected' || belief === 'known_false')
+      if (level === undefined || !validEnums) return failure(path, 'invalid_memory_level')
+      const seq = rawNumber(fields.seq)
+      const strength = rawNumber(fields.strength)
+      const priority = rawNumber(fields.priority)
+      if (
+        seq === undefined ||
+        !Number.isInteger(seq) ||
+        seq < 1 ||
+        seq >= nextSeq ||
+        strength === undefined ||
+        !Number.isFinite(strength) ||
+        strength < 0 ||
+        priority === undefined ||
+        !Number.isFinite(priority)
+      )
+        return failure(path, 'invalid_memory_metrics')
+      const startTime = rawNumber(fields.startTime)
+      const endTime = rawNumber(fields.endTime)
+      if (
+        (fields.startTime !== undefined &&
+          (startTime === undefined || !Number.isFinite(startTime))) ||
+        (fields.endTime !== undefined && (endTime === undefined || !Number.isFinite(endTime))) ||
+        (startTime !== undefined && endTime !== undefined && endTime < startTime)
+      )
+        return failure(path, 'invalid_memory_metrics')
+      const factEventRef = rawStateRef(fields.factEventRef)
+      const factSnapshotRef = rawStateRef(fields.factSnapshotRef)
+      const acquiredAtRef = rawStateRef(fields.acquiredAtRef)
+      const originRef = rawStateRef(fields.originRef)
+      if (rawString(fields.content) === undefined) return failure(path, 'invalid_memory_content')
+      if (
+        factEventRef === undefined ||
+        factSnapshotRef === undefined ||
+        acquiredAtRef === undefined ||
+        originRef === undefined
+      )
+        return failure(path, 'invalid_memory_refs')
+      if (factSnapshotRef.path[0] === '$message') return failure(path, 'invalid_memory_refs')
+      const relatedEntityRefPaths = rawRelatedEntityRefPaths(struct)
+      if (relatedEntityRefPaths === undefined) return failure(path, 'invalid_memory_refs')
+      for (const relatedRefPath of relatedEntityRefPaths)
+        if (relatedRefPath[0] === '$message') return failure(path, 'invalid_memory_refs')
+      if (
+        originRef.commitId === SELF_COMMIT &&
+        originRef.path.length > 0 &&
+        originRef.path[0] !== '$message' &&
+        graph.inspect([...originRef.path]).kind === 'none'
+      )
+        return failure(path, 'invalid_memory_refs')
+
+      const rawChildren = rawStringList(fields.children)
+      if (rawChildren === undefined) return failure(path, 'invalid_memory_child_target')
+      for (const rawChild of rawChildren) {
+        const decoded = decodePathKeySafe(rawChild)
+        if (decoded.kind === 'none') return failure(path, 'invalid_memory_child_target')
+        const coordinates = parseCognitiveMemoryPath(decoded.value)
+        if (coordinates.kind === 'none') return failure(path, 'invalid_memory_child_target')
+        if (coordinates.value.rootPerspectiveId !== perspectiveId)
+          return failure(path, 'invalid_memory_child_owner')
+        const childRecord = records.get(coordinates.value.memoryId)
+        if (childRecord === undefined) return failure(path, 'invalid_memory_child_target')
+        const childLevel = rawMemoryLevel(rawString(childRecord.fields.level))
+        if (childLevel === undefined) return failure(childRecord.path, 'invalid_memory_level')
+        const childSeq = rawNumber(childRecord.fields.seq)
+        if (childSeq === undefined || !Number.isInteger(childSeq) || childSeq < 1)
+          return failure(childRecord.path, 'invalid_memory_metrics')
+        if (memoryLevelRank(childLevel) >= memoryLevelRank(level) || seq < childSeq)
+          return failure(path, 'invalid_memory_level_hierarchy')
+      }
+    }
+  }
+  return null
+}
+
 /**
  * Validate the final draft.
  *
@@ -167,5 +424,7 @@ export function validatePerspectiveTopology(
   if (edgeFailure) return err(edgeFailure)
   const inheritanceFailure = checkPerspectiveInheritance(graph)
   if (inheritanceFailure) return err(inheritanceFailure)
+  const memoryFailure = checkCognitiveMemories(graph)
+  if (memoryFailure) return err(memoryFailure)
   return ok(undefined)
 }

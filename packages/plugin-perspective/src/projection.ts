@@ -13,18 +13,23 @@ import type { Option } from '@sekaisen/core'
 import { BinaryHasher, NONE, some } from '@sekaisen/core'
 import type { SchemaMetaMap } from '@sekaisen/plugin-schema'
 import type { CommitHash, Path, StateRef, Value } from '@sekaisen/plugin-world'
-import { encodePathKey, valueEquals } from '@sekaisen/plugin-world'
+import { encodePathKey, SELF_COMMIT, valueEquals } from '@sekaisen/plugin-world'
 import type { ClaimEvaluator, FoldFacet, FoldResult, LiveFacetInput } from './claims.ts'
+import { globalSurfaceCandidate, isGlobalSurfaceField } from './global-surface.ts'
 import type { FieldNode, PerspectiveGraph, StructInstance } from './graph.ts'
 import { fieldInstancePath, linkTargets, pathsEqual, sortedUniquePaths } from './graph.ts'
 import { PerspectiveFailure } from './internal.ts'
-import { DEFAULT_PERSPECTIVE_PRIORITY } from './schemas.ts'
+import { readableMemoryRelatedEntities, readableMemorySummary } from './memory-access.ts'
+import { isSelfOwnedField, ownedInstances } from './ownership.ts'
+import type { CognitiveMemoryRecord } from './schemas.ts'
+import { DEFAULT_PERSPECTIVE_PRIORITY, MEMORY_LEVEL_RANK, PERSPECTIVES_ROOT } from './schemas.ts'
 import type { ObserverScopeState } from './scope.ts'
 import { computePublicChannelScope } from './scope.ts'
 import type {
   AdjudicatedPathResult,
   AgentWorldProjection,
   InspectedFieldView,
+  LinkedEntity,
   ObserverPrivateProjection,
   ProjectedFieldFacet,
   ProjectedFieldView,
@@ -33,7 +38,7 @@ import type {
   ScenePublicProjection,
   SearchableCorpusEntry,
 } from './types.ts'
-import { hasLinkRole, isEphemeralSpec, isLinkSpec } from './visibility.ts'
+import { isEphemeralSpec, isLinkSpec } from './visibility.ts'
 
 /** Dependencies required by every projection entry point. */
 export interface ProjectionDeps {
@@ -64,6 +69,10 @@ interface FieldEntry {
   readonly factCommitId: CommitHash
   readonly acquiredAtCommitId: CommitHash
   readonly foldedByDefault: boolean
+  /** Cognitive memory that produced this entry, when any. */
+  readonly memory?: CognitiveMemoryRecord
+  /** True only for the memory narrative `content` field (the corpus text). */
+  readonly memoryContent?: boolean
 }
 
 interface InstanceBucket {
@@ -150,22 +159,6 @@ function summaryOfLeaf(meta: SchemaMetaMap | undefined): Option<string> {
   return typeof summary === 'string' ? some(summary) : NONE
 }
 
-/**
- * Ownership grants private (`self`) access, not remote surface perception or
- * knowledge of explicitly secret (`ref`) fields. A private instance applies
- * self access to its otherwise surface fields, but never overrides leaf ref.
- */
-function isSelfOwnedField(
-  graph: PerspectiveGraph,
-  instance: StructInstance,
-  field: FieldNode,
-): boolean {
-  const visibility = graph.fieldVisibility(field)
-  return (
-    visibility !== 'ref' && (visibility === 'self' || graph.instanceVisibility(instance) === 'self')
-  )
-}
-
 function liveCandidateForField(
   graph: PerspectiveGraph,
   scope: Option<ObserverScopeState>,
@@ -191,6 +184,75 @@ function liveCandidateForField(
   })
 }
 
+/** One leaf explicitly declared as a global live-surface field on a struct root. */
+interface GlobalSurfaceField {
+  readonly instance: StructInstance
+  readonly field: FieldNode
+}
+
+/**
+ * Per-committed-graph memo of declared global leaves.
+ *
+ * Projection graphs are fixed Reader views (current or historical), so the
+ * declaration index cannot change between fields of one query. Draft graphs
+ * are never handed to projection entry points.
+ */
+const GLOBAL_SURFACE_FIELDS = new WeakMap<PerspectiveGraph, readonly GlobalSurfaceField[]>()
+
+/**
+ * Declared global live-surface leaves, discovered from the registered roots.
+ *
+ * Only a root that is itself a struct can declare a feed. Map roots and nested
+ * instances are never scanned, so `globalSurface` can never widen into "every
+ * entity" and unrelated surface roots stay invisible. The walk is bounded by
+ * the Reader root catalog, not by entity count and never per instance lookup.
+ *
+ * @param deps - Projection dependencies bound to one committed graph.
+ * @returns Declared global leaves in root/field declaration order.
+ */
+function globalSurfaceFields(deps: ProjectionDeps): readonly GlobalSurfaceField[] {
+  const cached = GLOBAL_SURFACE_FIELDS.get(deps.graph)
+  if (cached !== undefined) return cached
+  const found: GlobalSurfaceField[] = []
+  for (const root of deps.graph.rootPaths()) {
+    const instance = deps.graph.instance(root)
+    if (instance.kind === 'none') continue
+    for (const field of instance.value.fields.values())
+      if (isGlobalSurfaceField(deps.graph, instance.value, field))
+        found.push({ instance: instance.value, field })
+  }
+  const result = Object.freeze(found)
+  GLOBAL_SURFACE_FIELDS.set(deps.graph, result)
+  return result
+}
+
+/**
+ * Live global feed entry, folded through the observer's normal claims.
+ *
+ * The value is read from this projection's commit on every call, never from a
+ * synced observation or a writer cache. The evaluator fold keeps exclusions,
+ * rumors and observations in charge, so a global declaration cannot bypass
+ * arbitration.
+ *
+ * @param deps - Projection dependencies.
+ * @param ctx - Observer context.
+ * @param instance - Declaring root instance.
+ * @param field - Declared global leaf.
+ * @param mode - Routine or expanded facet values.
+ * @returns The folded entry, or `NONE` when the feed is not visible/valued.
+ */
+function globalFieldEntry(
+  deps: ProjectionDeps,
+  ctx: ObserverContext,
+  instance: StructInstance,
+  field: FieldNode,
+  mode: 'routine' | 'expanded',
+): Option<FieldEntry> {
+  const candidate = globalSurfaceCandidate(deps.graph, ctx.actor, instance, field)
+  if (candidate.kind === 'none') return NONE
+  return fieldEntry(deps, field.path, deps.evaluator.fold(field.path, candidate.value), mode)
+}
+
 function factOf(facet: FoldFacet, commitId: CommitHash): CommitHash {
   if (facet.sourceKind === 'direct_scope' || facet.sourceKind === 'self_owned') return commitId
   return facet.at.kind === 'some' ? facet.at.value : commitId
@@ -204,6 +266,7 @@ function acquiredOf(facet: FoldFacet, commitId: CommitHash): CommitHash {
 function projectFacet(facet: FoldFacet, mode: 'routine' | 'expanded'): ProjectedFieldFacet {
   const folded = mode === 'routine' && facet.summary.kind === 'some'
   const base = {
+    seq: facet.seq,
     summary: facet.summary,
     folded,
     sourceKind: facet.sourceKind,
@@ -385,25 +448,6 @@ function visibleInstances(ctx: ObserverContext, deps: ProjectionDeps): readonly 
   )
 }
 
-function ownedInstances(graph: PerspectiveGraph, rootEntity: Path): ReadonlyMap<string, Path> {
-  const owned = new Map<string, Path>()
-  const queue: Path[] = [rootEntity]
-  const seen = new Set<string>()
-  while (queue.length > 0) {
-    const path = queue.shift()!
-    const key = encodePathKey(path)
-    if (seen.has(key)) continue
-    seen.add(key)
-    owned.set(key, path)
-    for (const entry of graph.backlinks(path)) {
-      if (!hasLinkRole(entry.fieldSpec, 'owner', 'delegate', 'edge_from')) continue
-      const childKey = encodePathKey(entry.sourceInstancePath)
-      if (!owned.has(childKey)) queue.push(entry.sourceInstancePath)
-    }
-  }
-  return owned
-}
-
 /** Build the observer context shared by project/inspect/corpus. */
 export function observerContext(
   deps: ProjectionDeps,
@@ -458,6 +502,305 @@ function fieldClaimPaths(deps: ProjectionDeps): readonly Path[] {
   return sortedUniquePaths(result)
 }
 
+/** Segment naming the cognitive-memory Map under a perspective node. */
+const MEMORIES_SEGMENT = 'memories'
+
+/**
+ * Neutral positive seq for the observer-independent raw public surface.
+ *
+ * `scenePublic` is contractually byte-identical across observers and with
+ * `projectScopePublic`, while live agent-facing entries expose the observer's
+ * `nextSeq`. The shared prefix therefore carries this stable value; merged and
+ * private live entries are rebuilt with the observer sequence.
+ */
+const PUBLIC_SCENE_SEQ = 1
+
+/** Memory fields safe to expose to the owning/inheriting observer. */
+const MEMORY_PROJECTED_FIELDS = [
+  'level',
+  'eventOrigin',
+  'significance',
+  'tier',
+  'strength',
+  'belief',
+  'priority',
+  'seq',
+  'startTime',
+  'endTime',
+  'content',
+] as const
+
+/** Coordinates decoded from a four-segment memory instance path. */
+interface MemoryPathCoordinates {
+  readonly perspectiveId: string
+  readonly memoryId: string
+}
+
+/**
+ * Perspective id of `['perspectives', P, 'memories']`, when `path` is that Map.
+ *
+ * @param path - Candidate path.
+ * @returns The owning perspective id, or `NONE` for any other path.
+ */
+function memoryMapPerspectiveId(path: Path): Option<string> {
+  if (path.length !== PERSPECTIVES_ROOT.length + 2) return NONE
+  if (!PERSPECTIVES_ROOT.every((segment, index) => path[index] === segment)) return NONE
+  if (path[PERSPECTIVES_ROOT.length + 1] !== MEMORIES_SEGMENT) return NONE
+  return some(path[PERSPECTIVES_ROOT.length]!)
+}
+
+/**
+ * Decode `['perspectives', P, 'memories', M]`.
+ *
+ * @param path - Candidate path.
+ * @returns Coordinates for exactly four memory segments, otherwise `NONE`.
+ */
+function parseMemoryPath(path: Path): Option<MemoryPathCoordinates> {
+  if (path.length !== PERSPECTIVES_ROOT.length + 3) return NONE
+  const mapPerspective = memoryMapPerspectiveId(path.slice(0, PERSPECTIVES_ROOT.length + 2))
+  if (mapPerspective.kind === 'none') return NONE
+  return some({
+    perspectiveId: mapPerspective.value,
+    memoryId: path[PERSPECTIVES_ROOT.length + 2]!,
+  })
+}
+
+/**
+ * Authorized cognitive memory at an exact memory instance path.
+ *
+ * A memory is readable only through the observer's ordered inheritance chain,
+ * so a foreign perspective's memory is invisible even though the schema view
+ * contains it. Prefix exclusions at the memory path or any ancestor suppress
+ * it before any field is projected.
+ *
+ * @param deps - Projection dependencies.
+ * @param path - Memory instance path.
+ * @returns The memory record, or `NONE`.
+ */
+function memoryAtPath(deps: ProjectionDeps, path: Path): Option<CognitiveMemoryRecord> {
+  const parsed = parseMemoryPath(path)
+  if (parsed.kind === 'none') return NONE
+  if (!deps.evaluator.orderedPerspectives().includes(parsed.value.perspectiveId)) return NONE
+  const record = deps.evaluator.perspectives
+    .get(parsed.value.perspectiveId)
+    ?.memories.get(parsed.value.memoryId)
+  if (record === undefined) return NONE
+  if (record.ownerPerspectiveId !== parsed.value.perspectiveId) return NONE
+  if (!pathsEqual(record.path, path)) return NONE
+  if (deps.evaluator.suppressed(record.path, record.priority)) return NONE
+  return some(record)
+}
+
+/** Visible memories of one perspective, after prefix exclusions. */
+function memoryRecordsFor(
+  deps: ProjectionDeps,
+  perspectiveId: string,
+): readonly CognitiveMemoryRecord[] {
+  if (!deps.evaluator.orderedPerspectives().includes(perspectiveId)) return []
+  const record = deps.evaluator.perspectives.get(perspectiveId)
+  if (record === undefined) return []
+  const memories: CognitiveMemoryRecord[] = []
+  for (const memory of record.memories.values()) {
+    if (memory.ownerPerspectiveId !== perspectiveId) continue
+    if (deps.evaluator.suppressed(memory.path, memory.priority)) continue
+    memories.push(memory)
+  }
+  return memories
+}
+
+/**
+ * One projected memory field.
+ *
+ * Memory text is the observer's own narrative: `factEventRef` and
+ * `factSnapshotRef` provide time anchors only and are never dereferenced into
+ * objective message/state content. `SELF_COMMIT` anchors normalize to the
+ * fixed projection commit.
+ *
+ * @param deps - Projection dependencies.
+ * @param memory - Source memory record.
+ * @param fieldName - Safe field name.
+ * @param value - Subjective value.
+ * @param path - Exact field path.
+ * @returns The field entry.
+ */
+function memoryFieldEntry(
+  deps: ProjectionDeps,
+  memory: CognitiveMemoryRecord,
+  fieldName: string,
+  value: Value,
+  path: Path,
+): Option<FieldEntry> {
+  const at =
+    memory.factSnapshotRef.commitId === SELF_COMMIT
+      ? deps.commitId
+      : memory.factSnapshotRef.commitId
+  const acquiredAt =
+    memory.acquiredAtRef.commitId === SELF_COMMIT ? deps.commitId : memory.acquiredAtRef.commitId
+  const summary = fieldName === 'content' ? readableMemorySummary(deps.evaluator, memory) : NONE
+  const facet: FoldFacet = Object.freeze({
+    sourceKind: 'observed_claim',
+    seq: memory.seq,
+    priority: memory.priority,
+    belief: memory.belief,
+    source: NONE,
+    sources: Object.freeze([]),
+    coWitnesses: Object.freeze([]),
+    at: some(at),
+    acquiredAt: some(acquiredAt),
+    originEventRef: some(memory.originRef),
+    targetRef: some(memory.factSnapshotRef),
+    factEventRef: NONE,
+    value,
+    summary,
+    recordKey: memory.memoryId,
+  })
+  const projected = projectFacet(facet, 'routine')
+  return some(
+    Object.freeze({
+      path,
+      view: Object.freeze({ ...projected, additionalFacets: Object.freeze([]) }),
+      facet,
+      factCommitId: at,
+      acquiredAtCommitId: acquiredAt,
+      foldedByDefault: summary.kind === 'some',
+      memory,
+      memoryContent: fieldName === 'content',
+    }),
+  )
+}
+
+/**
+ * Safe, exclusion-filtered fields of one cognitive memory.
+ *
+ * Only narrative metadata is exposed. Evidence refs, supporting claim keys,
+ * `relatedEntities` rows and `children` links stay internal: related entities
+ * are projected solely through authorization-filtered corpus `linkedEntities`.
+ *
+ * @param deps - Projection dependencies.
+ * @param memory - Source memory record.
+ * @returns Projected field entries in the declared safe-field order.
+ */
+function memoryFieldEntries(
+  deps: ProjectionDeps,
+  memory: CognitiveMemoryRecord,
+): readonly FieldEntry[] {
+  const instance = deps.graph.instance(memory.path)
+  if (instance.kind === 'none') return []
+  const values: Record<string, Value> = {
+    level: memory.level,
+    eventOrigin: memory.eventOrigin,
+    significance: memory.significance,
+    tier: memory.tier,
+    strength: memory.strength,
+    belief: memory.belief,
+    priority: memory.priority,
+    seq: memory.seq,
+    content: memory.content,
+  }
+  if (memory.startTime.kind === 'some') values.startTime = memory.startTime.value
+  if (memory.endTime.kind === 'some') values.endTime = memory.endTime.value
+  const entries: FieldEntry[] = []
+  for (const fieldName of MEMORY_PROJECTED_FIELDS) {
+    if (!Object.hasOwn(values, fieldName)) continue
+    if (!instance.value.fields.has(fieldName)) continue
+    const path = [...memory.path, fieldName]
+    if (deps.evaluator.suppressed(path, memory.priority)) continue
+    const entry = memoryFieldEntry(deps, memory, fieldName, values[fieldName]!, path)
+    if (entry.kind === 'some') entries.push(entry.value)
+  }
+  return entries
+}
+
+/**
+ * Authorized projected field entry at one exact memory field path.
+ *
+ * @param deps - Projection dependencies.
+ * @param path - Candidate field path.
+ * @returns The entry, or `NONE` for non-memory/unknown/unauthorized fields.
+ */
+function memoryFieldEntryAt(deps: ProjectionDeps, path: Path): Option<FieldEntry> {
+  if (path.length !== PERSPECTIVES_ROOT.length + 4) return NONE
+  const memory = memoryAtPath(deps, path.slice(0, -1))
+  if (memory.kind === 'none') return NONE
+  for (const entry of memoryFieldEntries(deps, memory.value))
+    if (pathsEqual(entry.path, path)) return some(entry)
+  return NONE
+}
+
+/**
+ * Whether `path` is a memory instance or any node below one.
+ *
+ * Used to fence off internal memory structure (evidence refs, supporting
+ * claims, related-entity rows, child links) from generic instance expansion.
+ *
+ * @param path - Candidate path.
+ * @returns True for a memory path or a descendant of one.
+ */
+function isMemoryDescendant(path: Path): boolean {
+  for (let length = PERSPECTIVES_ROOT.length + 3; length <= path.length; length++)
+    if (parseMemoryPath(path.slice(0, length)).kind === 'some') return true
+  return false
+}
+
+/** Memory buckets plus the child memories folded by a live parent summary. */
+interface MemoryBuckets {
+  readonly own: BucketSet
+  readonly inherited: BucketSet
+  readonly foldedChildKeys: ReadonlySet<string>
+}
+
+/**
+ * Collect own and inherited cognitive memories.
+ *
+ * Own-root memories become private self instances; ancestor-perspective
+ * memories remain readable off-scene inheritance. A visible parent summary
+ * with `belief !== 'known_false'` folds visible child memories of strictly
+ * lower level whose sequence does not exceed the parent's. Corpus consumers
+ * keep the children and mark them folded instead.
+ *
+ * @param deps - Projection dependencies.
+ * @param ctx - Observer context.
+ * @returns Memory buckets and folded child keys.
+ */
+function collectMemoryBuckets(deps: ProjectionDeps, ctx: ObserverContext): MemoryBuckets {
+  const own = new BucketSet()
+  const inherited = new BucketSet()
+  const visible = new Map<string, CognitiveMemoryRecord>()
+  for (const perspectiveId of deps.evaluator.orderedPerspectives()) {
+    /*
+     * Every memory keeps its owning perspective's local seq. Inherited values
+     * are therefore source-ordered, not globally chronological observer
+     * timestamps; consumers must not compare seq across perspectives.
+     */
+    for (const memory of memoryRecordsFor(deps, perspectiveId)) {
+      const entries = memoryFieldEntries(deps, memory)
+      if (entries.length === 0) continue
+      const target = perspectiveId === ctx.rootId ? own : inherited
+      for (const entry of entries) target.add(entry.path, entry)
+      if (entries.some((entry) => entry.memoryContent))
+        visible.set(encodePathKey(memory.path), memory)
+    }
+  }
+  const foldedChildKeys = new Set<string>()
+  for (const parent of visible.values()) {
+    if (parent.belief === 'known_false') continue
+    const parentPath = parseMemoryPath(parent.path)
+    if (parentPath.kind === 'none') continue
+    for (const childPath of parent.children) {
+      const child = parseMemoryPath(childPath)
+      if (child.kind === 'none') continue
+      if (child.value.perspectiveId !== parentPath.value.perspectiveId) continue
+      const childKey = encodePathKey(childPath)
+      const childMemory = visible.get(childKey)
+      if (childMemory === undefined) continue
+      if (MEMORY_LEVEL_RANK[childMemory.level] >= MEMORY_LEVEL_RANK[parent.level]) continue
+      if (childMemory.seq > parent.seq) continue
+      foldedChildKeys.add(childKey)
+    }
+  }
+  return { own, inherited, foldedChildKeys }
+}
+
 interface Collected {
   readonly scenePublic: ScenePublicProjection | null
   readonly publicBuckets: BucketSet
@@ -465,51 +808,71 @@ interface Collected {
   readonly selfBuckets: BucketSet
   readonly offSceneBuckets: BucketSet
   readonly mergedBuckets: BucketSet
+  readonly memoryFoldedChildKeys: ReadonlySet<string>
 }
 
 /**
  * Schema dictionary for a bucket set.
  *
- * Live buckets describe the current instance. Claim-only buckets describe the
- * strongest authorized observed snapshot instead, so an unknown off-scene
- * deletion leaves descriptions, declared field names and custom
- * classification unchanged. Rumor-only buckets never read objective metadata
- * at the rumor-creation commit; their entries fall back to the current Reader
- * declaration or a stable synthetic label.
+ * Whole-schema expansion requires current spatial/ownership access or an
+ * effective historical entity discovery. Field observations describe their
+ * authorized snapshot fields; feeds and rumors never authorize sibling
+ * declarations, even when mixed in the same bucket. Historical labels remain
+ * bound to their recorded snapshot, not unknown current objective metadata.
  * Dictionary keys may be any legal Schema identifier, including `__proto__`;
  * all name-indexed containers use the same null-prototype convention as Schema.
  *
  * @param deps - Projection dependencies.
  * @param buckets - Buckets to describe.
+ * @param ctx - Observer structure permissions; omitted only for raw public builders.
  * @returns Frozen, encoded-instance-keyed schema dictionary.
  */
-function schemaOfBuckets(deps: ProjectionDeps, buckets: BucketSet): ProjectedSchemaDictionary {
+function schemaOfBuckets(
+  deps: ProjectionDeps,
+  buckets: BucketSet,
+  ctx?: ObserverContext,
+): ProjectedSchemaDictionary {
   const dictionary: Record<
     string,
     { description: string; fields: Record<string, { description: string }> }
   > = Object.create(null)
   for (const [key, bucket] of buckets.buckets) {
     const entries = [...bucket.fields.values(), ...bucket.customFields.values()]
-    const hasLive = entries.some(
-      (entry) =>
-        entry.facet.sourceKind === 'direct_scope' || entry.facet.sourceKind === 'self_owned',
-    )
+    const memoryInstance = parseMemoryPath(bucket.path).kind === 'some'
+    // Public builders select actual scene structure; observer views must prove
+    // spatial/ownership access independently of the bucket's mixture of values.
+    const currentStructure =
+      memoryInstance || ctx === undefined || ctx.owned.has(key) || isInLiveScope(ctx, bucket.path)
+    let discovered: Option<RememberedSnapshot> = NONE
+    if (
+      !currentStructure &&
+      deps.evaluator.effectiveDiscoveredPaths().some((path) => pathsEqual(path, bucket.path))
+    ) {
+      const discoveryCandidates: { commitId: CommitHash; priority: number }[] = []
+      for (const facet of deps.evaluator.fold(bucket.path).facets)
+        if (
+          facet.sourceKind === 'observed_claim' &&
+          facet.belief !== 'known_false' &&
+          facet.at.kind === 'some'
+        )
+          discoveryCandidates.push({ commitId: facet.at.value, priority: facet.priority })
+      if (discoveryCandidates.length > 0)
+        discovered = firstRememberedSnapshot(deps, bucket.path, discoveryCandidates)
+    }
     let shape: StructInstance | undefined
-    if (hasLive) {
-      const current = deps.graph.instance(bucket.path)
-      if (current.kind === 'some') shape = current.value
+    if (currentStructure) {
+      const instance = deps.graph.instance(bucket.path)
+      if (instance.kind === 'some') shape = instance.value
     } else {
-      // Claims are the authority for a remembered instance: current existence
-      // must not resurrect metadata after an unknown deletion, and a rumor-only
-      // bucket must never borrow objective shape at the rumor-creation commit.
-      const remembered = rememberedBucketSnapshot(deps, bucket)
+      const remembered =
+        discovered.kind === 'some' ? discovered : rememberedBucketSnapshot(deps, bucket)
       if (remembered.kind === 'some') {
         const instance = remembered.value.graph.instance(bucket.path)
         if (instance.kind === 'some') shape = instance.value
       }
     }
     const fields: Record<string, { description: string }> = Object.create(null)
-    if (shape) {
+    if (shape && !memoryInstance && (currentStructure || discovered.kind === 'some')) {
       for (const [name, spec] of Object.entries(shape.spec.fields))
         fields[name] = { description: spec.description }
     }
@@ -540,6 +903,10 @@ function schemaOfBuckets(deps: ProjectionDeps, buckets: BucketSet): ProjectedSch
  * @returns A non-empty description when any declaration exists.
  */
 function entryDescription(deps: ProjectionDeps, entry: FieldEntry): string {
+  if (entry.memory !== undefined) {
+    const declared = declaredDescription(deps.graph, entry.path)
+    return declared.kind === 'some' ? declared.value : rememberedLabel(entry.path)
+  }
   if (entry.facet.sourceKind !== 'rumor_claim') {
     const declared = declaredDescription(snapshotGraph(deps, entry.factCommitId), entry.path)
     if (declared.kind === 'some') return declared.value
@@ -582,6 +949,7 @@ function instanceViews(buckets: BucketSet): Readonly<Record<string, ProjectedIns
 function subsumedInstanceKeys(deps: ProjectionDeps, buckets: BucketSet): ReadonlySet<string> {
   const hidden = new Set<string>()
   for (const bucket of buckets.buckets.values()) {
+    if (parseMemoryPath(bucket.path).kind === 'some') continue
     const commits = new Set<CommitHash>()
     for (const entry of [...bucket.fields.values(), ...bucket.customFields.values()])
       if (entry.facet.sourceKind !== 'rumor_claim') commits.add(entry.factCommitId)
@@ -620,10 +988,11 @@ function mergeBuckets(target: BucketSet, source: BucketSet): void {
  * @param field - Effective Reader field with a stored value.
  * @returns The self-contained entry, or `NONE` when the field has no value.
  */
-function publicFieldEntry(deps: ProjectionDeps, field: FieldNode): Option<FieldEntry> {
+function publicFieldEntry(deps: ProjectionDeps, field: FieldNode, seq: number): Option<FieldEntry> {
   if (field.value.kind === 'none') return NONE
   const facet: FoldFacet = Object.freeze({
     sourceKind: 'direct_scope',
+    seq,
     priority: DEFAULT_PERSPECTIVE_PRIORITY,
     belief: 'believed',
     source: NONE,
@@ -662,7 +1031,7 @@ function publicFieldEntry(deps: ProjectionDeps, field: FieldNode): Option<FieldE
  * @param scope - Observer scope proven non-diverging by the scope engine.
  * @returns Public buckets for the ceiling.
  */
-function rawPublicBuckets(deps: ProjectionDeps, scope: ObserverScopeState): BucketSet {
+function rawPublicBuckets(deps: ProjectionDeps, scope: ObserverScopeState, seq: number): BucketSet {
   const buckets = new BucketSet()
   const sightCeiling = scope.sight.ceiling
   const soundCeiling = scope.sound.ceiling
@@ -680,7 +1049,7 @@ function rawPublicBuckets(deps: ProjectionDeps, scope: ObserverScopeState): Buck
       const channel = deps.graph.fieldSense(field)
       const channelDomains = channel === 'sight' ? scope.sight.publicPaths : scope.sound.publicPaths
       if (!channelDomains.has(key)) continue
-      const entry = publicFieldEntry(deps, field)
+      const entry = publicFieldEntry(deps, field, seq)
       if (entry.kind === 'some') buckets.add(field.path, entry.value)
     }
   }
@@ -765,8 +1134,28 @@ function collect(deps: ProjectionDeps, ctx: ObserverContext, forCorpus = false):
     }
   }
 
+  /*
+   * Declared global live-surface leaves are re-read from this projection's
+   * commit for staged physical observers. They stay out of the raw public
+   * prefix so every observer's scenePublic remains byte-identical, and they
+   * fold through the evaluator so exclusions and rumors keep their normal
+   * arbitration. A feed never grants ownership, navigation or link-target
+   * identities: those checks use geometric scope and discovery predicates,
+   * which a global leaf does not change.
+   */
+  if (ctx.scope.kind === 'some')
+    for (const { instance, field } of globalSurfaceFields(deps)) {
+      const key = encodePathKey(field.path)
+      if (handled.has(key)) continue
+      const entry = globalFieldEntry(deps, ctx, instance, field, 'routine')
+      if (entry.kind === 'none') continue
+      handled.add(key)
+      overrideBuckets.add(field.path, entry.value)
+    }
+
   // Memory-only paths not produced by the live pass (hidden fields, off-scene).
   for (const path of fieldClaimPaths(deps)) {
+    if (isMemoryDescendant(path)) continue
     if (handled.has(encodePathKey(path))) continue
     const fold = deps.evaluator.fold(path)
     const entry = fieldEntry(deps, path, fold, 'routine')
@@ -777,22 +1166,39 @@ function collect(deps: ProjectionDeps, ctx: ObserverContext, forCorpus = false):
     else offSceneBuckets.add(path, entry.value)
   }
 
+  // Own-root and inherited cognitive memories are observer-private content.
+  const memoryBuckets = collectMemoryBuckets(deps, ctx)
+  mergeBuckets(selfBuckets, memoryBuckets.own)
+  mergeBuckets(offSceneBuckets, memoryBuckets.inherited)
+  if (!forCorpus) {
+    for (const key of memoryBuckets.foldedChildKeys) {
+      selfBuckets.buckets.delete(key)
+      offSceneBuckets.buckets.delete(key)
+    }
+  }
+
   const publicBuckets = new BucketSet()
   let scenePublic: ScenePublicProjection | null = null
   if (ctx.scope.kind === 'some' && ctx.scope.value.canUseRawPublicScope) {
     const ceiling = ctx.scope.value.sight.ceiling
     if (ceiling.kind === 'some') {
-      const built = rawPublicBuckets(deps, ctx.scope.value)
-      if (!forCorpus) {
-        withoutSubsumed(deps, built)
-        const view = instanceViews(built)
+      if (forCorpus) {
+        mergeBuckets(
+          publicBuckets,
+          rawPublicBuckets(deps, ctx.scope.value, deps.evaluator.nextSeq()),
+        )
+      } else {
+        const shared = rawPublicBuckets(deps, ctx.scope.value, PUBLIC_SCENE_SEQ)
+        withoutSubsumed(deps, shared)
         scenePublic = Object.freeze({
           sceneRootPath: ceiling.value,
-          schemas: schemaOfBuckets(deps, built),
-          instances: view,
+          schemas: schemaOfBuckets(deps, shared),
+          instances: instanceViews(shared),
         })
+        const agent = rawPublicBuckets(deps, ctx.scope.value, deps.evaluator.nextSeq())
+        withoutSubsumed(deps, agent)
+        mergeBuckets(publicBuckets, agent)
       }
-      mergeBuckets(publicBuckets, built)
     }
   }
 
@@ -816,6 +1222,7 @@ function collect(deps: ProjectionDeps, ctx: ObserverContext, forCorpus = false):
     selfBuckets,
     offSceneBuckets,
     mergedBuckets,
+    memoryFoldedChildKeys: memoryBuckets.foldedChildKeys,
   }
 }
 
@@ -827,16 +1234,13 @@ function collect(deps: ProjectionDeps, ctx: ObserverContext, forCorpus = false):
  */
 export function buildProjection(deps: ProjectionDeps, ctx: ObserverContext): AgentWorldProjection {
   const collected = collect(deps, ctx)
+  const privateBuckets = new BucketSet()
+  mergeBuckets(privateBuckets, collected.selfBuckets)
+  mergeBuckets(privateBuckets, collected.overrideBuckets)
+  mergeBuckets(privateBuckets, collected.offSceneBuckets)
   const privateView: ObserverPrivateProjection = Object.freeze({
     rootPerspectiveId: ctx.rootId,
-    schemas: Object.freeze(
-      Object.assign(
-        Object.create(null),
-        schemaOfBuckets(deps, collected.selfBuckets),
-        schemaOfBuckets(deps, collected.overrideBuckets),
-        schemaOfBuckets(deps, collected.offSceneBuckets),
-      ),
-    ),
+    schemas: schemaOfBuckets(deps, privateBuckets, ctx),
     selfInstances: instanceViews(collected.selfBuckets),
     inScenePrivateOverrides: instanceViews(collected.overrideBuckets),
     offSceneKnownInstances: instanceViews(collected.offSceneBuckets),
@@ -845,7 +1249,7 @@ export function buildProjection(deps: ProjectionDeps, ctx: ObserverContext): Age
     rootPerspectiveId: ctx.rootId,
     scenePublic: collected.scenePublic === null ? NONE : some(collected.scenePublic),
     privateView,
-    schemas: schemaOfBuckets(deps, collected.mergedBuckets),
+    schemas: schemaOfBuckets(deps, collected.mergedBuckets, ctx),
     mergedInstances: instanceViews(collected.mergedBuckets),
   })
 }
@@ -877,7 +1281,7 @@ export function buildPublicProjection(
       if (deps.graph.fieldVisibility(field) !== 'surface') continue
       const channelDomains = deps.graph.fieldSense(field) === 'sight' ? sightDomains : soundDomains
       if (!channelDomains.has(key)) continue
-      const entry = publicFieldEntry(deps, field)
+      const entry = publicFieldEntry(deps, field, PUBLIC_SCENE_SEQ)
       if (entry.kind === 'some') buckets.add(field.path, entry.value)
     }
   }
@@ -895,6 +1299,16 @@ function fieldEntryAt(
   path: Path,
   mode: 'routine' | 'expanded',
 ): Option<FieldEntry> {
+  const memoryField = memoryFieldEntryAt(deps, path)
+  if (memoryField.kind === 'some') return memoryField
+  if (isMemoryDescendant(path)) return NONE
+  const global = globalSurfaceFields(deps).find((candidate) =>
+    pathsEqual(candidate.field.path, path),
+  )
+  if (global !== undefined) {
+    const entry = globalFieldEntry(deps, ctx, global.instance, global.field, mode)
+    if (entry.kind === 'some') return entry
+  }
   const instancePath = fieldInstancePath(path)
   const instance = deps.graph.instance(instancePath)
   if (instance.kind === 'some') {
@@ -1074,6 +1488,7 @@ function inspectedFromEntry(deps: ProjectionDeps, entry: FieldEntry): InspectedF
     path: entry.path,
     description: entryDescription(deps, entry),
     value: entry.facet.value,
+    seq: entry.facet.seq,
     summary: entry.facet.summary,
     sourceKind: entry.facet.sourceKind,
     at: entry.facet.at,
@@ -1100,6 +1515,28 @@ export function inspectPaths(
 ): readonly InspectedFieldView[] {
   const views: InspectedFieldView[] = []
   for (const path of targetPaths) {
+    const memory = memoryAtPath(deps, path)
+    if (memory.kind === 'some') {
+      const entries = memoryFieldEntries(deps, memory.value)
+      if (entries.length === 0) errorForUnauthorized(path)
+      for (const entry of entries) views.push(inspectedFromEntry(deps, entry))
+      continue
+    }
+    const mapPerspective = memoryMapPerspectiveId(path)
+    if (mapPerspective.kind === 'some') {
+      const entries = memoryRecordsFor(deps, mapPerspective.value).flatMap((record) => [
+        ...memoryFieldEntries(deps, record),
+      ])
+      if (entries.length === 0) errorForUnauthorized(path)
+      for (const entry of entries) views.push(inspectedFromEntry(deps, entry))
+      continue
+    }
+    const memoryField = memoryFieldEntryAt(deps, path)
+    if (memoryField.kind === 'some') {
+      views.push(inspectedFromEntry(deps, memoryField.value))
+      continue
+    }
+    if (isMemoryDescendant(path)) errorForUnauthorized(path)
     const inspection = deps.graph.inspect(path)
     const currentContainer =
       inspection.kind === 'some' &&
@@ -1155,6 +1592,19 @@ export function adjudicatePaths(
 ): readonly AdjudicatedPathResult[] {
   const results: AdjudicatedPathResult[] = []
   for (const path of targetPaths) {
+    const memory = memoryAtPath(deps, path)
+    if (memory.kind === 'some') {
+      results.push(
+        Object.freeze({
+          path,
+          authorized: memoryFieldEntries(deps, memory.value).length > 0,
+          subjective: NONE,
+          objective: deps.graph.inspect(path),
+          matchesObjectiveTruth: false,
+        }),
+      )
+      continue
+    }
     const entry = fieldEntryAt(deps, ctx, path, 'expanded')
     const subjective = entry.kind === 'some' ? some(inspectedFromEntry(deps, entry.value)) : NONE
     const objective = deps.graph.inspect(path)
@@ -1196,9 +1646,9 @@ function contentHash(text: string, summary: Option<string>): string {
  *
  * Authorization has two disjoint sources:
  * - for an entry anchored to the current commit, the link field must be
- *   genuinely live for this observer: effective public visibility in the
- *   current channel scope, or legitimate self-ownership, and its live facet
- *   must win the fold (exclusions and belief are respected);
+ *   genuinely live for this observer: declared global feed, effective public
+ *   visibility in the current channel scope, or legitimate self-ownership, and
+ *   its live facet must win the fold (exclusions and belief are respected);
  * - for any fact snapshot, an `observed_claim` about that exact link field
  *   must be anchored to the same commit and survive the fold.
  *
@@ -1226,6 +1676,16 @@ function linkFieldAuthorized(
         pathsEqual(candidate.path, factField.path),
       )
       if (currentField) {
+        const global = globalSurfaceCandidate(deps.graph, ctx.actor, current.value, currentField)
+        if (global.kind === 'some') {
+          const fold = deps.evaluator.fold(currentField.path, global.value)
+          if (
+            fold.primary.kind === 'some' &&
+            fold.primary.value.sourceKind === 'direct_scope' &&
+            fold.primary.value.belief !== 'known_false'
+          )
+            return true
+        }
         if (
           ctx.owned.has(encodePathKey(instancePath)) &&
           isSelfOwnedField(deps.graph, current.value, currentField)
@@ -1281,35 +1741,169 @@ function authorizedTarget(deps: ProjectionDeps, ctx: ObserverContext, target: Pa
 }
 
 /**
- * One-hop link targets from the entry's fact snapshot.
+ * Current authorized path for a linked entity coordinate.
+ *
+ * `currentPath` is disclosed only when the observer currently perceives or
+ * owns the identity. For off-scene entities known only through memory, the
+ * objective current existence is deliberately not probed: an unknown
+ * deletion/reappearance must not change the projected relation.
+ *
+ * @param ctx - Observer context.
+ * @param target - Entity path.
+ * @returns The same path when currently live/owned, otherwise `NONE`.
+ */
+function currentLinkedPath(ctx: ObserverContext, target: Path): Option<Path> {
+  const key = encodePathKey(target)
+  return ctx.owned.has(key) || isInLiveScope(ctx, target) ? some(target) : NONE
+}
+
+/** Deterministic relation preference used when one ref is reached twice. */
+const LINKED_RELATION_RANK: Record<LinkedEntity['relation'], number> = {
+  current_link: 0,
+  historical_link: 1,
+  ref_target: 2,
+  memory_entity: 3,
+}
+
+/**
+ * Stable de-duplication of linked entities by exact `(commitId, path)`.
+ *
+ * Different commits of the same logical entity remain distinct entries. When
+ * one exact coordinate is reachable through several relations, the earliest
+ * relation rank wins deterministically.
+ *
+ * @param entities - Candidate linked entities.
+ * @returns Frozen, `(commitId, pathKey)` sorted list.
+ */
+function finalizeLinkedEntities(entities: readonly LinkedEntity[]): readonly LinkedEntity[] {
+  const byKey = new Map<string, LinkedEntity>()
+  for (const entity of entities) {
+    const key = `${entity.ref.commitId}\u0000${encodePathKey(entity.ref.path)}`
+    const existing = byKey.get(key)
+    if (existing === undefined) {
+      byKey.set(key, entity)
+      continue
+    }
+    if (LINKED_RELATION_RANK[entity.relation] < LINKED_RELATION_RANK[existing.relation])
+      byKey.set(key, entity)
+  }
+  return Object.freeze(
+    [...byKey.entries()].sort((a, b) => a[0].localeCompare(b[0])).map((entry) => entry[1]),
+  )
+}
+
+/** Build one linked entity with conservative current-path disclosure. */
+function linkedEntity(
+  ctx: ObserverContext,
+  ref: StateRef,
+  relation: LinkedEntity['relation'],
+  role?: string,
+): LinkedEntity {
+  const currentPath = currentLinkedPath(ctx, ref.path)
+  return Object.freeze(
+    role === undefined
+      ? { ref: Object.freeze(ref), currentPath, relation }
+      : { ref: Object.freeze(ref), currentPath, relation, role },
+  )
+}
+
+function isStateRefValue(value: Value | StateRef): value is StateRef {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !(value instanceof Uint8Array) &&
+    !Array.isArray(value) &&
+    'commitId' in value &&
+    'path' in value &&
+    typeof value.commitId === 'string' &&
+    Array.isArray(value.path)
+  )
+}
+
+/** Whether a ref coordinate names a Struct instance in its own snapshot. */
+function structAtRef(deps: ProjectionDeps, ref: StateRef): boolean {
+  if (ref.path[0] === '$message') return false
+  const graph = ref.commitId === SELF_COMMIT ? deps.graph : snapshotGraph(deps, ref.commitId)
+  return graph.instance(ref.path).kind === 'some'
+}
+
+/**
+ * One-hop links and entity-targeting refs from the entry's fact snapshot.
  *
  * Link contents are always read from `entry.factCommitId`, so an unseen newer
  * edit cannot rewrite remembered edges. A rumor-claim entry never dereferences
- * the objective instance at the rumor-creation commit.
+ * the objective instance at the rumor-creation commit. Every disclosed target
+ * must pass both source-field authorization and target-identity authorization;
+ * entity refs additionally require a Struct snapshot, and message refs are
+ * never entities.
  *
  * @param deps - Projection dependencies.
  * @param ctx - Observer context.
- * @param entry - Corpus entry whose instance links are wanted.
- * @returns Sorted, visible target paths.
+ * @param entry - Corpus entry whose instance relations are wanted.
+ * @returns Sorted, de-duplicated linked entities.
  */
-function linkedTargets(
+function linkedEntitiesForEntry(
   deps: ProjectionDeps,
   ctx: ObserverContext,
   entry: FieldEntry,
-): readonly Path[] {
+): readonly LinkedEntity[] {
   if (entry.facet.sourceKind === 'rumor_claim') return []
   const factGraph = snapshotGraph(deps, entry.factCommitId)
   const instancePath = fieldInstancePath(entry.path)
   const instance = factGraph.instance(instancePath)
   if (instance.kind === 'none') return []
-  const targets: Path[] = []
+  const relation: LinkedEntity['relation'] =
+    entry.factCommitId === deps.commitId ? 'current_link' : 'historical_link'
+  const found: LinkedEntity[] = []
   for (const field of instance.value.fields.values()) {
-    if (!isLinkSpec(field.spec) || field.value.kind === 'none') continue
+    if (field.value.kind === 'none') continue
+    if (isLinkSpec(field.spec)) {
+      if (!linkFieldAuthorized(deps, ctx, instancePath, field, entry.factCommitId)) continue
+      for (const target of linkTargets(field.value.value))
+        if (authorizedTarget(deps, ctx, target))
+          found.push(linkedEntity(ctx, { commitId: entry.factCommitId, path: target }, relation))
+      continue
+    }
+    if (field.spec.valueKind !== 'ref') continue
+    const value = field.value.value
+    if (!isStateRefValue(value)) continue
+    const ref = value
+    if (ref.path[0] === '$message') continue
     if (!linkFieldAuthorized(deps, ctx, instancePath, field, entry.factCommitId)) continue
-    for (const target of linkTargets(field.value.value))
-      if (authorizedTarget(deps, ctx, target)) targets.push(target)
+    if (!authorizedTarget(deps, ctx, ref.path)) continue
+    if (!structAtRef(deps, ref)) continue
+    found.push(linkedEntity(ctx, ref, 'ref_target'))
   }
-  return sortedUniquePaths(targets)
+  return finalizeLinkedEntities(found)
+}
+
+/**
+ * Authorized historical entity associations of one cognitive memory.
+ *
+ * Only `relatedEntities` rows become links; evidence refs are never emitted.
+ * Each row needs an authorized target identity, a Struct at its exact
+ * historical coordinate, and an unsuppressed row path. A rumor (a false
+ * memory) never grants more: the memory itself is the only evidence.
+ *
+ * @param deps - Projection dependencies.
+ * @param ctx - Observer context.
+ * @param memory - Source memory record.
+ * @returns Sorted, de-duplicated `memory_entity` linked entities.
+ */
+function memoryLinkedEntities(
+  deps: ProjectionDeps,
+  ctx: ObserverContext,
+  memory: CognitiveMemoryRecord,
+): readonly LinkedEntity[] {
+  const found: LinkedEntity[] = []
+  for (const row of readableMemoryRelatedEntities(deps.evaluator, memory)) {
+    const ref = row.targetRef
+    if (ref.path[0] === '$message') continue
+    if (!authorizedTarget(deps, ctx, ref.path)) continue
+    if (!structAtRef(deps, ref)) continue
+    found.push(linkedEntity(ctx, ref, 'memory_entity', row.role))
+  }
+  return finalizeLinkedEntities(found)
 }
 
 /**
@@ -1363,11 +1957,19 @@ export function buildCorpus(
   for (const bucket of collected.mergedBuckets.buckets.values()) {
     const instanceKey = encodePathKey(bucket.path)
     for (const entry of [...bucket.fields.values(), ...bucket.customFields.values()]) {
+      // Memory metadata stays available in the projection tree, but retrieval
+      // sees only the subjective narrative (never sequence/ref plumbing).
+      if (entry.memory !== undefined && entry.memoryContent !== true) continue
       if (corpusEntryEphemeral(deps, entry)) continue
       const text = renderValue(entry.facet.value)
+      const linkedEntities =
+        entry.memory !== undefined && entry.memoryContent === true
+          ? memoryLinkedEntities(deps, ctx, entry.memory)
+          : linkedEntitiesForEntry(deps, ctx, entry)
       entries.push(
         Object.freeze({
           path: entry.path,
+          seq: entry.facet.seq,
           factCommitId: entry.factCommitId,
           acquiredAtCommitId: entry.acquiredAtCommitId,
           contentHash: contentHash(text, entry.facet.summary),
@@ -1376,8 +1978,12 @@ export function buildCorpus(
           sourceKind: entry.facet.sourceKind,
           priority: entry.facet.priority,
           belief: entry.facet.belief,
-          isFoldedInDefaultView: entry.foldedByDefault || subsumed.has(instanceKey),
-          linkedInstancePaths: linkedTargets(deps, ctx, entry),
+          isFoldedInDefaultView:
+            entry.foldedByDefault ||
+            subsumed.has(instanceKey) ||
+            collected.memoryFoldedChildKeys.has(instanceKey),
+          linkedEntities,
+          linkedInstancePaths: sortedUniquePaths(linkedEntities.map((entity) => entity.ref.path)),
         }),
       )
     }

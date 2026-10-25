@@ -1290,6 +1290,8 @@ export interface SchemaTransaction extends ReadonlySchemaView {
 export type CommitValidatorFn = (ctx: {
   /** Parent of the candidate commit; `NONE` when creating a root. */
   readonly parentId: Option<CommitHash>
+  /** Candidate message decoded with its Writer schema; plain strings use kind `$text`. */
+  readonly message: TypedCommitMessage
   /** Read-only logical view of all final changes, including defaults and migrations. */
   readonly draft: ReadonlySchemaView
   /** Canonical physical tree diff, including schema/metadata writes; values are copied per validator. */

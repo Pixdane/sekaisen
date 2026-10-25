@@ -10,11 +10,14 @@ import type { Option, Result } from '@sekaisen/core'
 import type {
   AnyReadableLens,
   HistoricalNodeInspection,
+  ReadonlySchemaView,
   SchemaError,
   SchemaTransaction,
   StructLens,
 } from '@sekaisen/plugin-schema'
 import type { CommitHash, Path, StateRef, Value } from '@sekaisen/plugin-world'
+import type { FoldFacet } from './claims.ts'
+import type { MemoryEventOrigin, MemoryLevel, MemorySignificance, MemoryTier } from './schemas.ts'
 import type { Visibility } from './visibility.ts'
 
 /** How strongly an observer accepts a claim. */
@@ -72,6 +75,14 @@ export interface ProjectedFieldFacet {
   readonly sources: readonly string[]
   /** Public body path keys of same-channel co-witnesses (never delegated root mind ids). */
   readonly coWitnesses: readonly string[]
+  /**
+   * Monotonic subjective sequence exposed to callers.
+   *
+   * Persisted claims/memories use their stored positive `seq`; live perception
+   * uses the observer's current `perspective.nextSeq`. The internal fold
+   * sentinel `0` is never exposed.
+   */
+  readonly seq: number
 }
 
 /** A projected field plus any coexisting non-overriding facets. */
@@ -162,6 +173,8 @@ export interface InspectedFieldView {
   readonly source: Option<string>
   readonly sources: readonly string[]
   readonly coWitnesses: readonly string[]
+  /** Monotonic subjective sequence; never the internal fold sentinel `0`. */
+  readonly seq: number
   readonly additionalFacets: readonly ProjectedFieldFacet[]
 }
 
@@ -176,6 +189,18 @@ export interface AdjudicatedPathResult {
   readonly objective: Option<HistoricalNodeInspection>
   /** Whether the primary subjective value still equals current objective truth. */
   readonly matchesObjectiveTruth: boolean
+}
+
+/** Associated entity resolved for a retrieval corpus entry. */
+export interface LinkedEntity {
+  /** Exact state reference of the entity at its fact time. */
+  readonly ref: StateRef
+  /** Current branch path when the entity also physically survives there. */
+  readonly currentPath: Option<Path>
+  /** Provenance class of the association. */
+  readonly relation: 'current_link' | 'historical_link' | 'ref_target' | 'memory_entity'
+  /** Optional memory relation role or link field role. */
+  readonly role?: string
 }
 
 /** Pre-filtered memory/RAG corpus entry for one observer. */
@@ -195,8 +220,17 @@ export interface SearchableCorpusEntry {
   readonly belief: BeliefState
   /** Whether routine projection folds this entry (summary or subsumption). */
   readonly isFoldedInDefaultView: boolean
+  /**
+   * Monotonic subjective sequence exposed to callers.
+   *
+   * Persisted claims/memories use their stored positive `seq`; live perception
+   * uses the observer's current `perspective.nextSeq`.
+   */
+  readonly seq: number
   /** One-hop link targets also visible to this observer. */
   readonly linkedInstancePaths: readonly Path[]
+  /** Canonical associated-entity set, including historical snapshot coordinates. */
+  readonly linkedEntities: readonly LinkedEntity[]
 }
 
 /**
@@ -242,6 +276,26 @@ export type PerspectiveError =
       readonly kind: 'invalid_claim_target'
       readonly targetPath: Path
       readonly reason: string
+    }
+  | {
+      readonly kind: 'invalid_memory_target'
+      readonly memoryPath: Path
+      readonly reason: string
+    }
+  | {
+      readonly kind: 'memory_not_found'
+      readonly rootPerspectiveId: string
+      readonly memoryId: string
+    }
+  | {
+      readonly kind: 'memory_conflict'
+      readonly memoryPath: Path
+      readonly detail: string
+    }
+  | {
+      readonly kind: 'carry_over_source_unavailable'
+      readonly sourceCommitId: CommitHash
+      readonly detail: string
     }
   | { readonly kind: 'schema_error'; readonly error: SchemaError }
 
@@ -334,6 +388,148 @@ export type InspectPath = Path
 
 /** Alias kept for symmetry with schema inspection helpers. */
 export type AnyReadableLensAlias = AnyReadableLens
+
+/** Input accepted by `createMemory`. */
+export interface CreateMemoryInput {
+  /** Map key and final path segment. */
+  readonly id: string
+  readonly level?: MemoryLevel
+  readonly eventOrigin?: MemoryEventOrigin
+  readonly significance?: MemorySignificance
+  readonly tier?: MemoryTier
+  readonly strength?: number
+  readonly belief?: BeliefState
+  readonly priority?: number
+  readonly startTime?: number
+  readonly endTime?: number
+  readonly content: string
+  /** Micro-summary stored as `$meta.summary` on the content leaf. */
+  readonly summary?: string
+  /** Historical event reference; defaults to the current commit message. */
+  readonly factEventRef?: StateRef
+  /** Historical snapshot reference; defaults to the current state tree root. */
+  readonly factSnapshotRef?: StateRef
+  /** Acquisition event reference; defaults to the current commit message. */
+  readonly acquiredAtRef?: StateRef
+  /** Independent origin; defaults to the newly written memory's own path. */
+  readonly originRef?: StateRef
+  readonly supportingClaimKeys?: readonly string[]
+  readonly children?: readonly Path[]
+  readonly relatedEntities?: Readonly<
+    Record<string, { readonly targetRef: StateRef; readonly role?: string }>
+  >
+}
+
+/** Mutable subset accepted by `updateMemory`. */
+export interface UpdateMemoryPatch {
+  readonly tier?: MemoryTier
+  readonly strength?: number
+  readonly belief?: BeliefState
+  readonly priority?: number
+  readonly content?: string
+  /** `NONE` removes the content-leaf summary; omission preserves it. */
+  readonly summary?: Option<string>
+  readonly children?: readonly Path[]
+}
+
+/** Input accepted by `summarizeMemories`. */
+export interface SummarizeMemoriesInput {
+  /** Map key and final path segment of the new summary memory. */
+  readonly id: string
+  /** Must be `L1` or `L2` and strictly above every child level. */
+  readonly level: 'L1' | 'L2'
+  readonly childMemoryIds: readonly string[]
+  readonly content: string
+  readonly summary?: string
+  readonly significance?: MemorySignificance
+  readonly tier?: MemoryTier
+  readonly strength?: number
+  readonly startTime?: number
+  readonly endTime?: number
+  /** Archive subsumed children by default. */
+  readonly archiveChildrenTier?: boolean
+}
+
+/** Forget modes replace physical deletion with state evolution. */
+export type ForgetMemoryMode = 'archive' | 'known_false' | 'exclude'
+
+/** Options for `propagateMemory`. */
+export interface PropagateMemoryOptions {
+  /** Target memory id; defaults to the source id and must not collide. */
+  readonly targetMemoryId?: string
+  /** Explicit acquisition event; defaults to the current commit message. */
+  readonly acquiredAtRef?: StateRef
+  /** Explicit origin record; defaults to the source memory path in this commit. */
+  readonly originRef?: StateRef
+}
+
+/** Selection accepted by `carryOver`. */
+export interface CarryOverSelection {
+  /** Source branch commit. */
+  readonly sourceCommitId: CommitHash
+  /** Observer whose canonical root perspective is shared by both branches. */
+  readonly observer: ObserverRef
+  /** Restrict memories; omission carries every surviving personal memory. */
+  readonly memoryIds?: readonly string[]
+  /** Carry personal effective claims and exclusions (default `true`). */
+  readonly includeClaims?: boolean
+  /** Optional per-claim filter applied to the source winning facet. */
+  readonly filterClaim?: (path: Path, facet: FoldFacet) => boolean
+  /** Injective id remapping applied to carried memories. */
+  readonly mapMemoryId?: (oldMemoryId: string) => string
+  /** Explicit reconnection map for children that are not carried. */
+  readonly existingChildMemoryMap?: Readonly<Record<string, string>>
+}
+
+/** Result of `carryOver`. */
+export interface CarryOverResult {
+  readonly rootPerspectiveId: string
+  readonly sourceCommitId: CommitHash
+  /** Old source memory id -> new branch memory id. */
+  readonly memoryIdMap: Readonly<Record<string, string>>
+  /** New memory paths written by this operation. */
+  readonly carriedMemoryPaths: readonly Path[]
+  /** Encoded full paths of claims and exclusions written by this operation. */
+  readonly carriedClaimKeys: readonly string[]
+  /** Inclusive allocated sequence range; empty carries return `[start, start - 1]`. */
+  readonly allocatedSeqRange: readonly [number, number]
+}
+
+/** Coordinate components of a four-segment cognitive memory path. */
+export interface MemoryPathCoordinates {
+  readonly rootPerspectiveId: string
+  readonly memoryId: string
+}
+
+/** Node of the observer's cognitive memory summary DAG. */
+export interface CognitiveMemoryTreeNode {
+  readonly memoryId: string
+  readonly path: Path
+  readonly level: MemoryLevel
+  readonly seq: number
+  readonly tier: MemoryTier
+  readonly strength: number
+  readonly belief: BeliefState
+  readonly summary: Option<string>
+  readonly content: string
+  /** Memories directly subsumed by this node; cycle-safe. */
+  readonly subsumedChildren: readonly CognitiveMemoryTreeNode[]
+}
+
+/**
+ * Side-effect-free topology protocol shared with upper plugins.
+ *
+ * These reads never materialize state and never touch private modules.
+ */
+export interface PerspectiveTopologyReader {
+  /** Resolve any entity path or perspective identifier to its canonical root id. */
+  resolveRootPerspectiveAt(
+    view: ReadonlySchemaView,
+    observer: ObserverRef,
+  ): Result<string, PerspectiveError>
+  /** Recognize `['perspectives', P, 'memories', M]`; absence is `NONE`. */
+  parseCognitiveMemoryPath(path: Path): Option<MemoryPathCoordinates>
+}
 
 /**
  * Perspective service contract registered as `ctx.perspective`.
@@ -467,7 +663,115 @@ export interface PerspectiveServiceApi {
     options?: ActivateDelegateOptions,
   ): Result<void, PerspectiveError>
 
-  /* 3. Projection, expansion, adjudication and retrieval */
+  /* 3. Observer-private cognitive memories and cross-timeline carry-over */
+  /**
+   * Write one subjective memory under the observer's canonical root perspective.
+   *
+   * `seq` is allocated from that perspective's `nextSeq`; enum, metric,
+   * reference and same-perspective child invariants are validated before the
+   * first write. `originRef` defaults to the newly written record's own path;
+   * the record is appended atomically without advancing the objective clock.
+   * Memory content is subjective and never replaced by objective evidence.
+   */
+  createMemory(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    input: CreateMemoryInput,
+  ): Result<Path, PerspectiveError>
+
+  /**
+   * Update mutable memory state in place without changing sequence or owner.
+   *
+   * The whole patch is one savepoint. Sequence, level, refs and owner are not
+   * mutable; children updates are re-validated against the same-perspective
+   * level and sequence hierarchy.
+   */
+  updateMemory(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    memoryId: string,
+    patch: UpdateMemoryPatch,
+  ): Result<void, PerspectiveError>
+
+  /**
+   * Create an `L1`/`L2` summary over same-perspective child memories.
+   *
+   * Every child must exist, belong to the same root, and satisfy strict level
+   * and sequence progression. Children are archived by default through the
+   * same savepoint; a failure writes nothing.
+   */
+  summarizeMemories(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    input: SummarizeMemoriesInput,
+  ): Result<Path, PerspectiveError>
+
+  /**
+   * Forget through state evolution rather than physical deletion.
+   *
+   * `archive` changes the tier, `known_false` changes belief so summaries stop
+   * folding children, and `exclude` appends a high-priority exclusion for the
+   * memory path. Nothing is deleted.
+   */
+  forgetMemory(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    memoryId: string,
+    mode: ForgetMemoryMode,
+  ): Result<void, PerspectiveError>
+
+  /**
+   * Retell one self-owned memory to another observer.
+   *
+   * Content, level, significance, tier, metrics, belief and historical entity
+   * references survive; acquisition time advances to this commit, acquisition
+   * evidence keys are dropped, children are not implicitly reconnected, and
+   * the new id must not collide with the receiver's existing memories.
+   */
+  propagateMemory(
+    tx: SchemaTransaction,
+    fromObserver: ObserverRef,
+    toObserver: ObserverRef,
+    memoryId: string,
+    options?: PropagateMemoryOptions,
+  ): Result<Path, PerspectiveError>
+
+  /**
+   * Migrate surviving personal claims and memories across branches of the same
+   * root perspective.
+   *
+   * Source order drives new local sequence allocation; historical refs and
+   * claim origins survive, acquisition events advance to this commit, children
+   * reconnect only for batch-carried memories or explicit existing mappings,
+   * and ids must remain injective without overwriting target memories.
+   */
+  carryOver(
+    tx: SchemaTransaction,
+    selection: CarryOverSelection,
+  ): Result<CarryOverResult, PerspectiveError>
+
+  /**
+   * Assemble the observer's own `L2 -> L1 -> L0` summary DAG.
+   *
+   * Reads are host-only, cycle-safe for malformed drafts, and omit memories
+   * hidden by effective exclusions. Shared children may appear under multiple
+   * parents.
+   */
+  inspectCognitiveMemoryTree(
+    commitIdOrView: CommitHash | ReadonlySchemaView,
+    observer: ObserverRef,
+  ): Result<readonly CognitiveMemoryTreeNode[], PerspectiveError>
+
+  /** Resolve an observer at a read-only view without materializing state. */
+  resolveRootPerspectiveAt(
+    view: ReadonlySchemaView,
+    observer: ObserverRef,
+  ): Result<string, PerspectiveError>
+
+  /** Recognize a four-segment cognitive memory path without reading state. */
+  parseCognitiveMemoryPath(path: Path): Option<MemoryPathCoordinates>
+
+  /* 4. Projection, expansion, adjudication and retrieval */
   /** Raw standard double-channel public surface rooted at `sceneRoot`. */
   projectScopePublic(
     commitId: CommitHash,

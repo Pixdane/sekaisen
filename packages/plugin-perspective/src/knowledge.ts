@@ -8,13 +8,14 @@
  */
 
 import type { Result } from '@sekaisen/core'
+import { NONE } from '@sekaisen/core'
 import type { SchemaTransaction } from '@sekaisen/plugin-schema'
 import type { Path, StateRef, Value } from '@sekaisen/plugin-world'
 import { encodePathKey, encodeValue, SELF_COMMIT } from '@sekaisen/plugin-world'
 import { assertPersistentClaimTarget } from './claim-policy.ts'
-import type { PerspectiveGraph } from './graph.ts'
 import { PerspectiveGraph as Graph } from './graph.ts'
-import { attemptPerspective } from './internal.ts'
+import { attemptPerspective, PerspectiveFailure } from './internal.ts'
+import { readableFieldsAt } from './ownership.ts'
 import type { PerspectiveReader } from './reader.ts'
 import { coWitnessKeys } from './reader.ts'
 import type { ExclusionClaimInput, PerspectiveRecord, RumorClaimInput } from './schemas.ts'
@@ -27,7 +28,6 @@ import type {
   ObserverRef,
   PerspectiveError,
 } from './types.ts'
-import { isEphemeralSpec } from './visibility.ts'
 
 /**
  * Record a historical observation of a leaf field, or discover an instance.
@@ -72,9 +72,23 @@ export function grantKnowledge(
     const target = source.inspect(targetPath)
 
     if (target.kind === 'some' && target.value.nodeKind !== 'leaf') {
+      let historicalRoot = resolved.rootEntity
+      if (at !== SELF_COMMIT) {
+        try {
+          historicalRoot = reader.resolveObserver(source, observer).rootEntity
+        } catch (cause) {
+          if (
+            cause instanceof PerspectiveFailure &&
+            cause.error.kind === 'observer_entity_not_found'
+          )
+            historicalRoot = NONE
+          else throw cause
+        }
+      }
       ensurePerspective(tx, resolved.id, resolved.rootEntity)
       writeDiscovery(tx, resolved.id, perspectiveRecord(tx, resolved.id), targetPath, options)
-      for (const field of surfaceFields(source, targetPath)) {
+      for (const field of readableFieldsAt(source, historicalRoot, targetPath)) {
+        if (field.value.kind === 'none') continue
         writeObservation(tx, resolved.id, perspectiveRecord(tx, resolved.id), field.path, options)
       }
       return
@@ -227,13 +241,4 @@ function writeObservation(
     ...(options?.source !== undefined ? { source: options.source } : {}),
   })
   bumpSeq(tx, id, seq + 1)
-}
-
-function surfaceFields(graph: PerspectiveGraph, instancePath: Path): readonly { path: Path }[] {
-  const instance = graph.instance(instancePath)
-  if (instance.kind === 'none') return []
-  return [...instance.value.fields.values()]
-    .filter((field) => graph.fieldVisibility(field) === 'surface')
-    .filter((field) => !isEphemeralSpec(field.spec))
-    .filter((field) => field.value.kind === 'some')
 }

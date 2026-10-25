@@ -17,18 +17,31 @@
  * Cordis façade plus registration; it owns no algorithms of its own.
  */
 
-import type { Result } from '@sekaisen/core'
-import type { SchemaTransaction, StructLens } from '@sekaisen/plugin-schema'
+import type { Option, Result } from '@sekaisen/core'
+import type { ReadonlySchemaView, SchemaTransaction, StructLens } from '@sekaisen/plugin-schema'
 import { s } from '@sekaisen/plugin-schema'
 import type { CommitHash, Path, Value } from '@sekaisen/plugin-world'
 import type { Context } from 'cordis'
 import { Service } from 'cordis'
+import { carryOver as carryMemories } from './carry.ts'
 import { configurePerspective as configure } from './configure.ts'
 import {
   excludeKnowledge as exclude,
   grantKnowledge as grant,
   grantRumor as rumor,
 } from './knowledge.ts'
+import {
+  createMemory as createMem,
+  forgetMemory as forgetMem,
+  propagateMemory as propagateMem,
+  summarizeMemories as summarizeMem,
+  updateMemory as updateMem,
+} from './memory.ts'
+import {
+  parseCognitiveMemoryPath as parseMemoryPath,
+  resolveRootPerspectiveAt as resolveRootAt,
+} from './memory-topology.ts'
+import { inspectCognitiveMemoryTree as inspectMemoryTree } from './memory-tree.ts'
 import { propagateKnowledge as propagate } from './propagate.ts'
 import {
   inspectForAdjudication as adjudicate,
@@ -48,19 +61,28 @@ import type {
   ActivateDelegateOptions,
   AdjudicatedPathResult,
   AgentWorldProjection,
+  CarryOverResult,
+  CarryOverSelection,
+  CognitiveMemoryTreeNode,
   ConfigurePerspectiveInput,
+  CreateMemoryInput,
   ExcludeKnowledgeOptions,
+  ForgetMemoryMode,
   GrantKnowledgeOptions,
   GrantRumorOptions,
   InspectedFieldView,
+  MemoryPathCoordinates,
   ObserverRef,
   PerspectiveError,
   PerspectiveServiceApi,
   PropagateKnowledgeOptions,
+  PropagateMemoryOptions,
   ScenePublicProjection,
   ScopedObserverPerspective,
   SearchableCorpusEntry,
+  SummarizeMemoriesInput,
   SyncScopeOptions,
+  UpdateMemoryPatch,
 } from './types.ts'
 
 declare module 'cordis' {
@@ -174,6 +196,84 @@ export class PerspectiveService extends Service implements PerspectiveServiceApi
     options?: ActivateDelegateOptions,
   ): Result<void, PerspectiveError> {
     return activate(tx, fromInstanceLens, toInstanceLens, options)
+  }
+
+  /** Write one subjective memory under the observer's root perspective. */
+  createMemory(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    input: CreateMemoryInput,
+  ): Result<Path, PerspectiveError> {
+    return createMem(this.reader, tx, observer, input)
+  }
+
+  /** Update mutable memory state without changing owner, level or sequence. */
+  updateMemory(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    memoryId: string,
+    patch: UpdateMemoryPatch,
+  ): Result<void, PerspectiveError> {
+    return updateMem(this.reader, tx, observer, memoryId, patch)
+  }
+
+  /** Create an `L1`/`L2` summary over same-perspective memories. */
+  summarizeMemories(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    input: SummarizeMemoriesInput,
+  ): Result<Path, PerspectiveError> {
+    return summarizeMem(this.reader, tx, observer, input)
+  }
+
+  /** Forget through tier, belief or exclusion evolution; never deletion. */
+  forgetMemory(
+    tx: SchemaTransaction,
+    observer: ObserverRef,
+    memoryId: string,
+    mode: ForgetMemoryMode,
+  ): Result<void, PerspectiveError> {
+    return forgetMem(this.reader, tx, observer, memoryId, mode)
+  }
+
+  /** Retell one self-owned memory to another observer. */
+  propagateMemory(
+    tx: SchemaTransaction,
+    fromObserver: ObserverRef,
+    toObserver: ObserverRef,
+    memoryId: string,
+    options?: PropagateMemoryOptions,
+  ): Result<Path, PerspectiveError> {
+    return propagateMem(this.reader, tx, fromObserver, toObserver, memoryId, options)
+  }
+
+  /** Migrate surviving personal claims and memories across branches. */
+  carryOver(
+    tx: SchemaTransaction,
+    selection: CarryOverSelection,
+  ): Result<CarryOverResult, PerspectiveError> {
+    return carryMemories(this.reader, tx, selection)
+  }
+
+  /** Host-only cycle-safe cognitive memory summary DAG. */
+  inspectCognitiveMemoryTree(
+    commitIdOrView: CommitHash | ReadonlySchemaView,
+    observer: ObserverRef,
+  ): Result<readonly CognitiveMemoryTreeNode[], PerspectiveError> {
+    return inspectMemoryTree(this.reader, commitIdOrView, observer)
+  }
+
+  /** Resolve an observer at a read-only view without materializing state. */
+  resolveRootPerspectiveAt(
+    view: ReadonlySchemaView,
+    observer: ObserverRef,
+  ): Result<string, PerspectiveError> {
+    return resolveRootAt(view, observer)
+  }
+
+  /** Recognize a four-segment cognitive memory path. */
+  parseCognitiveMemoryPath(path: Path): Option<MemoryPathCoordinates> {
+    return parseMemoryPath(path)
   }
 
   /** Host-only raw standard public surface rooted at `sceneRoot`. */

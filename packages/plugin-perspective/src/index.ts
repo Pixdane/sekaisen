@@ -15,6 +15,14 @@
  * ```
  */
 
+export {
+  MEMORY_SELF_MESSAGE_REF,
+  MEMORY_SELF_ROOT_SNAPSHOT,
+} from './memory.ts'
+export {
+  parseCognitiveMemoryPath,
+  resolveRootPerspectiveAt,
+} from './memory-topology.ts'
 export * from './schemas.ts'
 export { PerspectiveService, PerspectiveService as default } from './service.ts'
 export * from './types.ts'

@@ -26,6 +26,132 @@ export const ALL_PERSPECTIVE_ID = 'all'
 /** Default priority for newly materialized perspectives. */
 export const DEFAULT_PERSPECTIVE_PRIORITY = 1000
 
+/** Rank order of cognitive memory levels; `L0 < L1 < L2`. */
+export const MEMORY_LEVEL_RANK: Readonly<Record<MemoryLevel, number>> = Object.freeze({
+  L0: 0,
+  L1: 1,
+  L2: 2,
+})
+
+/** Memory summarisation levels. */
+export type MemoryLevel = 'L0' | 'L1' | 'L2'
+
+/** Provenance class of a cognitive memory record. */
+export type MemoryEventOrigin = 'scene' | 'world' | 'reflection' | 'carry_over'
+
+/** Dramatic significance of a memory. */
+export type MemorySignificance = 'routine' | 'notable' | 'critical'
+
+/** Retention tier of a memory. */
+export type MemoryTier = 'pinned' | 'active' | 'archive'
+
+/** All legal memory levels in ascending rank order. */
+export const MEMORY_LEVELS: readonly MemoryLevel[] = Object.freeze(['L0', 'L1', 'L2'])
+
+/** All legal memory event origins. */
+export const MEMORY_EVENT_ORIGINS: readonly MemoryEventOrigin[] = Object.freeze([
+  'scene',
+  'world',
+  'reflection',
+  'carry_over',
+])
+
+/** All legal memory significance values. */
+export const MEMORY_SIGNIFICANCES: readonly MemorySignificance[] = Object.freeze([
+  'routine',
+  'notable',
+  'critical',
+])
+
+/** All legal memory retention tiers. */
+export const MEMORY_TIERS: readonly MemoryTier[] = Object.freeze(['pinned', 'active', 'archive'])
+
+/** Rank of a memory level; unknown levels sort below `L0` for defensive reads. */
+export function memoryLevelRank(level: string): number {
+  return MEMORY_LEVEL_RANK[level as MemoryLevel] ?? 0
+}
+
+/**
+ * Historical entity association stored as a true cross-commit reference.
+ *
+ * Using `s.ref()` keeps the exact `(commitId, entityPath)` coordinate of the
+ * entity at the remembered moment, including entities from other branches,
+ * and participates in World pin protection and rebase remapping.
+ */
+export const MemoryRelatedEntitySchema = s.struct({
+  /** Historical entity snapshot coordinate (`$message` targets are rejected). */
+  targetRef: s.ref().desc('historical entity snapshot reference (commitId, entityPath)'),
+  /** Semantic relation of the entity to this memory. */
+  role: s.str().default('participant').desc('semantic relation of the entity to this memory'),
+})
+
+/**
+ * Observer-private cognitive memory node.
+ *
+ * Memories are subjective narratives. Projection never replaces `content`
+ * with an objective event/snapshot payload, and filtering or overriding the
+ * supporting claims never mutates an assembled narrative.
+ */
+export const CognitiveMemorySchema = s.struct({
+  /** Owning root perspective id; must equal the `P` path segment. */
+  ownerPerspectiveId: s.str().desc('owning root perspective id (must match path segment P)'),
+  /** Monotonic positive sequence in this perspective, sourced from `nextSeq`. */
+  seq: s.num().desc('monotonic positive integer sequence in this perspective'),
+  /** Summarisation level: `L0` (0) < `L1` (1) < `L2` (2). */
+  level: s.str().default('L0').desc('L0 | L1 | L2'),
+  /** Provenance class of this record. */
+  eventOrigin: s.str().default('scene').desc('scene | world | reflection | carry_over'),
+  /** Dramatic significance. */
+  significance: s.str().default('routine').desc('routine | notable | critical'),
+  /** Retention tier. */
+  tier: s.str().default('active').desc('pinned | active | archive'),
+  /** Finite non-negative retention strength. */
+  strength: s.num().default(1).desc('non-negative memory retention strength'),
+  /** Acceptance state. */
+  belief: s.str().default('believed').desc('believed | suspected | known_false'),
+  /** Finite priority weight, defaulted from the owning perspective. */
+  priority: s.num().desc('finite priority weight'),
+  /** Optional objective start time in minutes. */
+  startTime: s.num().optional().desc('optional historical objective start time in minutes'),
+  /** Optional objective end time in minutes; must not precede `startTime`. */
+  endTime: s.num().optional().desc('optional historical objective end time in minutes'),
+  /** Subjective narrative. Never replaced by objective evidence. */
+  content: s.str().desc('subjective memory narrative text'),
+  /** Historical event message reference. */
+  factEventRef: s.ref().desc('historical commit message reference of the event'),
+  /** Historical state-tree snapshot reference (never `$message`). */
+  factSnapshotRef: s.ref().desc('historical state tree snapshot reference'),
+  /** Acquisition event reference in the current line. */
+  acquiredAtRef: s.ref().desc('event reference when this memory was acquired or carried over'),
+  /** Independent origin record; preserved across carry-over for provenance. */
+  originRef: s.ref().desc('origin memory or event reference'),
+  /** Supporting claim keys in this perspective; evidence does not rewrite content. */
+  supportingClaimKeys: s
+    .list('str')
+    .default([])
+    .desc('optional supporting claim keys within the same perspective'),
+  /**
+   * Lower-level memories subsumed by this summary.
+   *
+   * Targets stay inside the same perspective, must satisfy strict level and
+   * sequence progression, and form a globally acyclic graph. Deleting a parent
+   * only unlinks children.
+   */
+  children: s
+    .linkList({
+      targetRoots: [PERSPECTIVES_ROOT],
+      acyclic: true,
+      onDelete: 'unlink',
+    })
+    .default([])
+    .meta({ visibility: 'surface', linkRoles: ['subsumes'] })
+    .desc('subsumed lower-level cognitive memory paths within the same perspective'),
+  /** Cross-commit associated entities keyed by relation slot id. */
+  relatedEntities: s
+    .map(MemoryRelatedEntitySchema)
+    .desc('related historical entity references keyed by relation slot id'),
+})
+
 /**
  * Historical observation snapshot.
  *
@@ -136,6 +262,8 @@ export const PerspectiveNodeSchema = s.struct({
   rumorClaims: s.map(RumorClaimSchema).desc('literal rumor claims'),
   /** Exclusions keyed by `${targetPrefixKey}#${seq}`. */
   exclusions: s.map(ExclusionClaimSchema).desc('path-prefix exclusions'),
+  /** Observer-private cognitive memories keyed by memoryId. */
+  memories: s.map(CognitiveMemorySchema).desc('cognitive memory nodes keyed by memory id'),
 })
 
 /** In-memory observation record read from the perspective Map. */
@@ -206,6 +334,64 @@ export interface ExclusionClaimRecord {
   readonly priority: number
 }
 
+/** Decoded association between a memory and a historical entity snapshot. */
+export interface CognitiveMemoryRelatedEntityRecord {
+  /** Relation slot key from the stored `relatedEntities` Map. */
+  readonly slot: string
+  /** Historical entity coordinate. */
+  readonly targetRef: StateRef
+  /** Semantic relation role. */
+  readonly role: string
+}
+
+/** In-memory cognitive memory record read from the perspective Map. */
+export interface CognitiveMemoryRecord {
+  /** Map key (`memoryId`). */
+  readonly memoryId: string
+  /** Full instance path `['perspectives', P, 'memories', memoryId]`. */
+  readonly path: Path
+  /** Root perspective id; must equal `P`. */
+  readonly ownerPerspectiveId: string
+  /** Monotonic positive sequence. */
+  readonly seq: number
+  /** Summarisation level. */
+  readonly level: MemoryLevel
+  /** Provenance class. */
+  readonly eventOrigin: MemoryEventOrigin
+  /** Dramatic significance. */
+  readonly significance: MemorySignificance
+  /** Retention tier. */
+  readonly tier: MemoryTier
+  /** Finite non-negative retention strength. */
+  readonly strength: number
+  /** Acceptance state. */
+  readonly belief: BeliefState
+  /** Finite priority weight. */
+  readonly priority: number
+  /** Optional objective start time. */
+  readonly startTime: Option<number>
+  /** Optional objective end time. */
+  readonly endTime: Option<number>
+  /** Subjective narrative. */
+  readonly content: string
+  /** Optional `$meta.summary` of the content leaf. */
+  readonly summary: Option<string>
+  /** Historical event message reference. */
+  readonly factEventRef: StateRef
+  /** Historical state-tree snapshot reference. */
+  readonly factSnapshotRef: StateRef
+  /** Acquisition event reference. */
+  readonly acquiredAtRef: StateRef
+  /** Independent origin record. */
+  readonly originRef: StateRef
+  /** Supporting claim keys in the same perspective. */
+  readonly supportingClaimKeys: readonly string[]
+  /** Decoded subsumed memory paths. */
+  readonly children: readonly Path[]
+  /** Related historical entity snapshots sorted by relation slot. */
+  readonly relatedEntities: readonly CognitiveMemoryRelatedEntityRecord[]
+}
+
 /** Claim-data view of one perspective node with defaults already applied. */
 export interface PerspectiveRecord {
   /** Perspective id (named id or encoded root entity path). */
@@ -228,6 +414,8 @@ export interface PerspectiveRecord {
   readonly rumorClaims: ReadonlyMap<string, RumorClaimRecord>
   /** Prefix exclusions by map key. */
   readonly exclusions: ReadonlyMap<string, ExclusionClaimRecord>
+  /** Cognitive memories keyed by memory id. */
+  readonly memories: ReadonlyMap<string, CognitiveMemoryRecord>
 }
 
 /** Claim record input accepted by schema transaction writes. */
@@ -303,4 +491,55 @@ export interface PerspectiveInput {
   readonly observedClaims?: Readonly<Record<string, ObservedClaimInput>>
   readonly rumorClaims?: Readonly<Record<string, RumorClaimInput>>
   readonly exclusions?: Readonly<Record<string, ExclusionClaimInput>>
+  readonly memories?: Readonly<Record<string, CognitiveMemoryInput>>
+}
+
+/** Related-entity input accepted by cognitive memory writes. */
+export interface CognitiveMemoryRelatedEntityInput {
+  /** Historical entity snapshot coordinate. */
+  readonly targetRef: StateRef
+  /** Optional semantic role; defaults to `'participant'`. */
+  readonly role?: string
+}
+
+/** Cognitive memory input accepted by schema transaction writes. */
+export interface CognitiveMemoryInput {
+  /** Owning root perspective id; must match the containing Map path. */
+  readonly ownerPerspectiveId: string
+  /** Monotonic positive sequence. */
+  readonly seq: number
+  /** Summarisation level; defaults to `L0` in the schema. */
+  readonly level: MemoryLevel
+  /** Provenance class; defaults to `scene` in the schema. */
+  readonly eventOrigin: MemoryEventOrigin
+  /** Dramatic significance; defaults to `routine` in the schema. */
+  readonly significance: MemorySignificance
+  /** Retention tier; defaults to `active` in the schema. */
+  readonly tier: MemoryTier
+  /** Finite non-negative retention strength. */
+  readonly strength: number
+  /** Acceptance state. */
+  readonly belief: BeliefState
+  /** Finite priority weight. */
+  readonly priority: number
+  /** Optional objective start time. */
+  readonly startTime?: number
+  /** Optional objective end time. */
+  readonly endTime?: number
+  /** Subjective narrative. */
+  readonly content: string
+  /** Historical event message reference. */
+  readonly factEventRef: StateRef
+  /** Historical state-tree snapshot reference. */
+  readonly factSnapshotRef: StateRef
+  /** Acquisition event reference. */
+  readonly acquiredAtRef: StateRef
+  /** Independent origin record. */
+  readonly originRef: StateRef
+  /** Supporting claim keys in the same perspective. */
+  readonly supportingClaimKeys: readonly string[]
+  /** Encoded subsumed memory path keys. */
+  readonly children: readonly string[]
+  /** Related historical entities keyed by relation slot. */
+  readonly relatedEntities: Readonly<Record<string, CognitiveMemoryRelatedEntityInput>>
 }
