@@ -11,13 +11,9 @@ import type { Result } from '@sekaisen/core'
 import type { StructLens } from '@sekaisen/plugin-schema'
 import type { CommitHash, Path } from '@sekaisen/plugin-world'
 import { attemptPerspective, fail } from './internal.ts'
-import {
-  adjudicatePaths,
-  buildCorpus,
-  buildProjection,
-  buildPublicProjection,
-  inspectPaths,
-} from './projection.ts'
+import { buildCorpus } from './projection/corpus.ts'
+import { adjudicatePaths, inspectPaths } from './projection/inspect.ts'
+import { buildProjection, buildPublicProjection } from './projection/views.ts'
 import type { PerspectiveReader } from './reader.ts'
 import { observerPath } from './reader.ts'
 import { ALL_PERSPECTIVE_ID } from './schemas.ts'

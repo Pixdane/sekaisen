@@ -98,3 +98,25 @@ test('a summary whose narrative is excluded cannot hide its child memory', () =>
       ?.fields.content?.value,
   ).toBe('A concrete remembered detail')
 })
+
+test('rumors cannot bypass the memory namespace fence through invalid memory coordinates', () => {
+  const f = new PerspectiveFixture()
+  fixtures.push(f)
+  f.seed()
+  const paths = [
+    ['perspectives', '$ghost', 'memories', 'event', 'content'],
+    ['perspectives', f.key('alice'), 'memories', '$event', 'content'],
+  ]
+  const rumored = f.commit('record rumors at non-materializable memory coordinates', (tx) => {
+    for (const path of paths)
+      unwrap(f.perspective.grantRumor(tx, f.at('alice'), path, 'MEMORY_NAMESPACE_RUMOR'))
+  })
+  for (const path of paths)
+    expect(f.perspective.inspect(rumored.id, f.at('alice'), [path])).toMatchObject({
+      ok: false,
+      error: { kind: 'not_authorized', targetPath: path },
+    })
+  const view = unwrap(f.perspective.projectView(rumored.id, f.at('alice')))
+  const corpus = unwrap(f.perspective.listSearchableCorpus(rumored.id, f.at('alice')))
+  expect(JSON.stringify({ view, corpus })).not.toContain('MEMORY_NAMESPACE_RUMOR')
+})
