@@ -1,6 +1,7 @@
 export { OMP_PI_AI_ADAPTER_KIND, OmpPiAiAdapter } from './adapter.ts'
 export type {
   OmpApiKeyResolver,
+  OmpAuthDiscovery,
   OmpAuthKeyContext,
   OmpAuthResolverOptions,
   OmpAuthStorageLike,

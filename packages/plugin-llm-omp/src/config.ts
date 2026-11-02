@@ -1,5 +1,5 @@
 import { InvariantError } from '@sekaisen/core'
-import type { OmpAuthStorageLike } from './auth.ts'
+import type { OmpAuthDiscovery, OmpAuthStorageLike } from './auth.ts'
 import type { OmpCapabilityOverrides } from './capabilities.ts'
 import type { FetchImpl, OmpModelResolver, OmpStreamBackend } from './pi-ai.ts'
 
@@ -34,8 +34,10 @@ export interface OmpPiAiAdapterOptions {
   /** Route id → subscription channel binding. */
   readonly routes: Readonly<Record<string, OmpRouteConfig>>
   /**
-   * Pre-opened real `AuthStorage` (or structural equivalent). When omitted the
-   * adapter lazily runs `discoverAuthStorage()` against `agentDir`/broker.
+   * Pre-opened real `AuthStorage` (or structural equivalent). Borrowed: the
+   * adapter never closes it; the host owns its lifetime. When omitted the
+   * adapter lazily runs `discoverAuthStorage()` against `agentDir`/broker and
+   * owns the discovered store.
    */
   readonly authStorage?: OmpAuthStorageLike
   /** Custom `omp` agent directory containing `agent.db`. */
@@ -47,6 +49,13 @@ export interface OmpPiAiAdapterOptions {
    * store. When set, no `AuthStorage` is opened and no rotation is available.
    */
   readonly resolveApiKey?: (provider: string) => Promise<string | undefined>
+  /**
+   * Test/host seam for credential discovery. Production defaults to the real
+   * `discoverOmpAuthStorage()`; a discovered store is owned and closed by the
+   * adapter, unlike an injected `authStorage`. Ignored when `authStorage` or
+   * `resolveApiKey` is supplied.
+   */
+  readonly discoverAuthStorage?: OmpAuthDiscovery
   /** Session id used for credential affinity and prompt-cache routing. */
   readonly sessionId?: string
   /** Test seam: narrow pi-ai stream backend. Production defaults to `streamSimple`. */

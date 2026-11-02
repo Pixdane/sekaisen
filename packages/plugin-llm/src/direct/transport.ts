@@ -725,9 +725,20 @@ export function sanitizeMessage(
 /** Normalize any thrown value into a safe {@link LlmFailure}. */
 export function classifyDirectFailure(cause: unknown, secrets: readonly string[]): LlmFailure {
   if (isLlmFailure(cause)) {
+    const status = optionOf<number>(Reflect.get(cause, 'status'))
+    const retryAfterMs = optionOf<number>(Reflect.get(cause, 'retryAfterMs'))
+    // A stale or hostile thrown failure must not make `failure()` throw and
+    // escape the transport: drop fields outside the documented ranges.
+    const statusIsValid =
+      isSome(status) &&
+      Number.isSafeInteger(status.value) &&
+      status.value >= 100 &&
+      status.value <= 599
+    const retryIsValid =
+      isSome(retryAfterMs) && Number.isFinite(retryAfterMs.value) && retryAfterMs.value >= 0
     return failure(cause.code, sanitizeMessage(cause.message, secrets), {
-      status: optionOf<number>(Reflect.get(cause, 'status')),
-      retryAfterMs: optionOf<number>(Reflect.get(cause, 'retryAfterMs')),
+      status: statusIsValid ? status : NONE,
+      retryAfterMs: retryIsValid ? retryAfterMs : NONE,
       requestId: sanitizeRequestId(Reflect.get(cause, 'requestId'), secrets),
     })
   }
@@ -1146,6 +1157,24 @@ function failedFinish(error: LlmFailure, observedAttempts: number): StreamChunk 
   }
 }
 
+/**
+ * Terminal frame for a classified failure. The stream protocol requires an
+ * `aborted` reason exactly when the failure code is `ABORTED`; every other
+ * classified transport failure stays an `error` frame. Keeping this in one
+ * place prevents an internally aborted transport from failing the guard.
+ */
+function classifiedFinish(error: LlmFailure, observedAttempts: number): StreamChunk {
+  return {
+    type: 'finish',
+    reason:
+      error.code === 'ABORTED'
+        ? { kind: 'aborted', failure: error }
+        : { kind: 'error', failure: error },
+    replayState: NONE,
+    observedAttempts,
+  }
+}
+
 function normalizeFinish(
   chunk: Extract<StreamChunk, { type: 'finish' }>,
   observedAttempts: number,
@@ -1156,6 +1185,23 @@ function normalizeFinish(
     reason: chunk.reason,
     replayState: failed ? NONE : chunk.replayState,
     observedAttempts,
+  }
+}
+
+type DispatchOutcome =
+  | { readonly kind: 'dispatched'; readonly promise: Promise<Response> }
+  | { readonly kind: 'threw'; readonly cause: unknown }
+
+/**
+ * Invoke the injected `fetch` without letting a synchronous throw escape the
+ * transport generator. The thunk preserves the call-site binding of a custom
+ * implementation; the caller owns classification and abort priority.
+ */
+function dispatchFetch(dispatch: () => Promise<Response>): DispatchOutcome {
+  try {
+    return { kind: 'dispatched', promise: dispatch() }
+  } catch (cause) {
+    return { kind: 'threw', cause }
   }
 }
 
@@ -1190,7 +1236,7 @@ async function* runDirectStream(context: DirectStreamContext): AsyncGenerator<St
       yield abortFinish(0)
       return
     }
-    yield failedFinish(classifyDirectFailure(cause, secrets), 0)
+    yield classifiedFinish(classifyDirectFailure(cause, secrets), 0)
     return
   }
 
@@ -1220,14 +1266,28 @@ async function* runDirectStream(context: DirectStreamContext): AsyncGenerator<St
   try {
     let response: Response
     attempts = 1
-    const dispatched = context.fetchImpl(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(wire.body),
-      signal: streamController.signal,
-    })
+    const dispatch = dispatchFetch(() =>
+      context.fetchImpl(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(wire.body),
+        signal: streamController.signal,
+      }),
+    )
+    // A custom `fetch` implementation may throw synchronously (before it ever
+    // returns a promise). That is a transport failure of this single attempt,
+    // not a caller-visible rejection, so it must become a sanitised terminal
+    // frame — caller cancellation still takes priority over the cause.
+    if (dispatch.kind === 'threw') {
+      if (signal.aborted) {
+        yield abortFinish(attempts)
+        return
+      }
+      yield classifiedFinish(classifyDirectFailure(dispatch.cause, secrets), attempts)
+      return
+    }
     const responseOutcome = await raceOperation(
-      dispatched,
+      dispatch.promise,
       streamController.signal,
       firstEventDeadline,
     )
@@ -1251,7 +1311,7 @@ async function* runDirectStream(context: DirectStreamContext): AsyncGenerator<St
         yield abortFinish(attempts)
         return
       }
-      yield failedFinish(classifyDirectFailure(responseOutcome.error, secrets), attempts)
+      yield classifiedFinish(classifyDirectFailure(responseOutcome.error, secrets), attempts)
       return
     }
     response = responseOutcome.result
@@ -1282,7 +1342,7 @@ async function* runDirectStream(context: DirectStreamContext): AsyncGenerator<St
           yield abortFinish(attempts)
           return
         }
-        yield failedFinish(classifyDirectFailure(bodyOutcome.error, secrets), attempts)
+        yield classifiedFinish(classifyDirectFailure(bodyOutcome.error, secrets), attempts)
         return
       }
       yield failedFinish(classifyHttpResponse(response, bodyOutcome.result, secrets), attempts)
@@ -1323,7 +1383,7 @@ async function* runDirectStream(context: DirectStreamContext): AsyncGenerator<St
         yield abortFinish(attempts)
         return
       }
-      yield failedFinish(classifyDirectFailure(cause, secrets), attempts)
+      yield classifiedFinish(classifyDirectFailure(cause, secrets), attempts)
       return
     }
 

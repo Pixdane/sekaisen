@@ -1,5 +1,6 @@
 import { InvariantError } from '@sekaisen/core'
 import {
+  canonicalJsonNumber,
   cloneJsonValue,
   codePointLength,
   createDataObject,
@@ -138,12 +139,12 @@ function decodeNumber(
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return fail(path, nodeLabel(node), describeReceived(value), 'Expected a finite JSON number')
   }
-  if (node.integerOnly && !Number.isInteger(value)) {
+  if (node.integerOnly && !Number.isSafeInteger(value)) {
     return fail(
       path,
-      'integer',
+      'safe integer',
       describeReceived(value),
-      'Expected an integer without a fractional part',
+      'Expected an integer within the safe integer range',
     )
   }
   if (node.minimum !== undefined && value < node.minimum) {
@@ -162,7 +163,7 @@ function decodeNumber(
       `Number is above maximum ${node.maximum}`,
     )
   }
-  return succeed(value)
+  return succeed(canonicalJsonNumber(value))
 }
 
 function decodeBoolean(value: unknown, path: readonly string[]): DecodeOutcome {
@@ -185,6 +186,7 @@ function decodeLiteral(
       `Expected exactly ${jsonText(node.value)}`,
     )
   }
+  if (typeof value === 'number') return succeed(canonicalJsonNumber(value))
   return succeed(value)
 }
 

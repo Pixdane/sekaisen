@@ -87,7 +87,14 @@ export function ompFailure(
   ) {
     throw new InvariantError('LlmFailure.status must be an HTTP status between 100 and 599')
   }
-  const retryAfterMs: Option<number> = details.retryAfterMs ?? NONE
+  const suppliedRetryAfterMs: Option<number> = details.retryAfterMs ?? NONE
+  // `-0` is not a canonical protocol measure: the neutral Guard rejects it, and
+  // it carries no more meaning than `+0`. Canonicalize before validation so a
+  // provider-derived zero cannot make an otherwise valid failure unusable.
+  const retryAfterMs: Option<number> =
+    suppliedRetryAfterMs.kind === 'some' && Object.is(suppliedRetryAfterMs.value, -0)
+      ? some(0)
+      : suppliedRetryAfterMs
   if (
     retryAfterMs.kind === 'some' &&
     (!Number.isFinite(retryAfterMs.value) || retryAfterMs.value < 0)

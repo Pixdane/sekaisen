@@ -57,14 +57,16 @@ export function validString(value: unknown, nonempty = false): value is string {
   return typeof value === 'string' && (!nonempty || value.length > 0) && value.isWellFormed()
 }
 
-/** Guard for non-negative safe integers used by token counts and block indexes. */
+/** Guard for canonical non-negative safe integers used by token counts and block indexes. */
 export function validSafeCount(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+  return (
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0)
+  )
 }
 
-/** Guard for finite non-negative numbers used by costs and retry delays. */
+/** Guard for canonical finite non-negative protocol measures (costs and retry delays). */
 export function validFiniteNonNegative(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && !Object.is(value, -0)
 }
 
 /**
@@ -182,7 +184,11 @@ export function failure(
   if (isSome(status) && !validHttpStatus(status.value)) {
     throw new InvariantError('LlmFailure.status must be an HTTP status between 100 and 599')
   }
-  const retryAfterMs: Option<number> = details.retryAfterMs ?? NONE
+  const suppliedRetryAfterMs: Option<number> = details.retryAfterMs ?? NONE
+  const retryAfterMs =
+    isSome(suppliedRetryAfterMs) && Object.is(suppliedRetryAfterMs.value, -0)
+      ? some(0)
+      : suppliedRetryAfterMs
   if (isSome(retryAfterMs) && !validFiniteNonNegative(retryAfterMs.value)) {
     throw new InvariantError('LlmFailure.retryAfterMs must be a finite non-negative number')
   }

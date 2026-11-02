@@ -1,5 +1,5 @@
 import type { Result } from '@sekaisen/core'
-import { err, NONE, ok } from '@sekaisen/core'
+import { err, InvariantError, NONE, ok } from '@sekaisen/core'
 import type {
   AdapterRetryOwnership,
   BoundWireChatRequest,
@@ -10,7 +10,12 @@ import type {
   RouteId,
   StreamChunk,
 } from '@sekaisen/plugin-llm'
-import { discoverOmpAuthStorage, type OmpApiKeyResolver, type OmpAuthStorageLike } from './auth.ts'
+import {
+  discoverOmpAuthStorage,
+  type OmpApiKeyResolver,
+  type OmpAuthDiscovery,
+  type OmpAuthStorageLike,
+} from './auth.ts'
 import { OMP_SUPPORTED_APIS, ompModelCapabilities } from './capabilities.ts'
 import type { OmpPiAiAdapterOptions, OmpRouteConfig } from './config.ts'
 import { freezeOmpRoutes } from './config.ts'
@@ -30,6 +35,12 @@ interface ResolvedTarget {
 }
 
 const OMP_CALL_ABORTED: unique symbol = Symbol('omp.call.aborted')
+
+/**
+ * Sanitized close failure text. The original cause is never attached: broker or
+ * transport errors may embed endpoints or credential material.
+ */
+const OMP_CLOSE_FAILURE = '@sekaisen/plugin-llm-omp owned credential store close failed'
 
 /**
  * Races one per-call wait against caller cancellation without cancelling the
@@ -64,12 +75,19 @@ async function raceOmpCallWithAbort<T>(
  * discovery promise at construction and each bound stream awaits the same
  * generation. A discovery failure is converted into a terminal
  * `MISSING_CREDENTIAL` finish on every stream attempted by that generation.
+ *
+ * A store this session discovered is owned and closed exactly once by
+ * `dispose()`; an injected `authStorage` is borrowed and never closed.
  */
 class OmpAuthSession {
   #storage: OmpAuthStorageLike | undefined = undefined
   #promise: Promise<OmpAuthStorageLike> | undefined = undefined
   #startupError: unknown = undefined
   #staticKey: ((provider: string) => Promise<string | undefined>) | undefined = undefined
+  #owned = false
+  #disposed = false
+  #disposePromise: Promise<void> | undefined = undefined
+  #closePromise: Promise<void> | undefined = undefined
 
   constructor(options: OmpPiAiAdapterOptions) {
     if (options.authStorage !== undefined) {
@@ -80,11 +98,23 @@ class OmpAuthSession {
       this.#staticKey = options.resolveApiKey
       return
     }
-    const promise = discoverOmpAuthStorage({
+    this.#owned = true
+    const discover: OmpAuthDiscovery = options.discoverAuthStorage ?? discoverOmpAuthStorage
+    const promise = discover({
       ...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
       ...(options.cachePath === undefined ? {} : { cachePath: options.cachePath }),
     }).then(
-      (storage) => storage,
+      (storage) => {
+        this.#storage = storage
+        if (this.#disposed) {
+          // Discovery may finish after disposal; release the store immediately.
+          void this.#closeOwned(storage).catch(() => {
+            // `dispose()` awaits the same close promise; this handler only keeps
+            // a late close from becoming an unhandled rejection.
+          })
+        }
+        return storage
+      },
       (cause) => {
         this.#startupError = cause
         throw cause
@@ -105,17 +135,68 @@ class OmpAuthSession {
   }
 
   async session(): Promise<OmpAuthStorageLike> {
+    if (this.#disposed) {
+      throw new InvariantError('@sekaisen/plugin-llm-omp credential session is disposed')
+    }
     if (this.#storage !== undefined) return this.#storage
     if (this.#startupError !== undefined) throw this.#startupError
     if (this.#promise === undefined) {
       throw new Error('No credential store is configured for @sekaisen/plugin-llm-omp')
     }
-    this.#storage = await this.#promise
-    return this.#storage
+    const storage = await this.#promise
+    if (this.#disposed) {
+      throw new InvariantError('@sekaisen/plugin-llm-omp credential session is disposed')
+    }
+    this.#storage = storage
+    return storage
   }
 
   async staticKey(provider: string): Promise<string | undefined> {
     return this.#staticKey?.(provider)
+  }
+
+  /**
+   * Releases the store this session opened, exactly once. An injected
+   * `authStorage` and the static-key seam own no resource. Pending discovery is
+   * awaited so an unload cannot report completion before the store it opened
+   * has been closed.
+   */
+  dispose(): Promise<void> {
+    if (this.#disposePromise !== undefined) return this.#disposePromise
+    this.#disposed = true
+    if (!this.#owned) {
+      this.#disposePromise = Promise.resolve()
+    } else if (this.#storage !== undefined) {
+      this.#disposePromise = this.#closeOwned(this.#storage)
+    } else if (this.#promise === undefined) {
+      this.#disposePromise = Promise.resolve()
+    } else {
+      this.#disposePromise = this.#promise.then(
+        (opened) => this.#closeOwned(opened),
+        () => undefined,
+      )
+    }
+    return this.#disposePromise
+  }
+
+  #closeOwned(storage: OmpAuthStorageLike): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise
+    const close = storage.close
+    if (close === undefined) {
+      this.#closePromise = Promise.resolve()
+      return this.#closePromise
+    }
+    try {
+      this.#closePromise = Promise.resolve(close.call(storage)).then(
+        () => undefined,
+        () => {
+          throw new InvariantError(OMP_CLOSE_FAILURE)
+        },
+      )
+    } catch {
+      this.#closePromise = Promise.reject(new InvariantError(OMP_CLOSE_FAILURE))
+    }
+    return this.#closePromise
   }
 }
 
@@ -135,6 +216,8 @@ export class OmpPiAiAdapter implements ChatAdapter {
   readonly #resolveModel: OmpModelResolver
   readonly #fetch: FetchImpl
   readonly #sessionId: string | undefined
+  #disposed = false
+  #disposePromise: Promise<void> | undefined = undefined
 
   constructor(options: OmpPiAiAdapterOptions) {
     this.#routes = freezeOmpRoutes(options.routes)
@@ -148,12 +231,34 @@ export class OmpPiAiAdapter implements ChatAdapter {
   /** Eager initialisation seam: surfaces credential-startup failures at boot. */
   static async create(options: OmpPiAiAdapterOptions): Promise<OmpPiAiAdapter> {
     const adapter = new OmpPiAiAdapter(options)
-    await adapter.ready()
+    try {
+      await adapter.ready()
+    } catch (cause) {
+      await adapter.dispose().catch(() => {
+        // Keep the startup failure authoritative; any owned store is closed.
+      })
+      throw cause
+    }
     return adapter
+  }
+
+  /**
+   * Releases the credential store this adapter discovered, exactly once.
+   * Injected `authStorage` and the static-key seam own nothing and are left
+   * untouched. Idempotent: later calls return the same settlement.
+   */
+  dispose(): Promise<void> {
+    if (this.#disposePromise !== undefined) return this.#disposePromise
+    this.#disposed = true
+    this.#disposePromise = this.#auth.dispose()
+    return this.#disposePromise
   }
 
   /** Awaits the credential store opened by this adapter generation. */
   async ready(): Promise<void> {
+    if (this.#disposed) {
+      throw new InvariantError('@sekaisen/plugin-llm-omp adapter is disposed')
+    }
     if (this.#auth.hasStaticKey) return
     await this.#auth.ready()
   }
@@ -218,6 +323,11 @@ export class OmpPiAiAdapter implements ChatAdapter {
     (request: BoundWireChatRequest, signal: AbortSignal) => AsyncIterable<StreamChunk>,
     LlmFailure
   > {
+    if (this.#disposed) {
+      return err(
+        ompFailure('REGISTRATION_DISPOSED', 'Adapter was disposed before binding a generation'),
+      )
+    }
     const resolved = this.#resolve(routeId, modelId)
     if (!resolved.ok) return resolved
     const model =
@@ -240,6 +350,22 @@ export class OmpPiAiAdapter implements ChatAdapter {
         reason: {
           kind: 'aborted',
           failure: ompFailure('ABORTED', 'Model call aborted before send'),
+        },
+        replayState: NONE,
+        observedAttempts: 0,
+      }
+      return
+    }
+
+    if (this.#disposed) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: ompFailure(
+            'REGISTRATION_DISPOSED',
+            'Adapter was disposed before the model call',
+          ),
         },
         replayState: NONE,
         observedAttempts: 0,
@@ -320,6 +446,21 @@ export class OmpPiAiAdapter implements ChatAdapter {
         }
         return
       }
+      if (this.#disposed) {
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: ompFailure(
+              'REGISTRATION_DISPOSED',
+              'Adapter was disposed while resolving credentials',
+            ),
+          },
+          replayState: NONE,
+          observedAttempts: 0,
+        }
+        return
+      }
       yield {
         type: 'finish',
         reason: { kind: 'error', failure: classifyOmpAuthFailure(cause, secrets) },
@@ -335,6 +476,22 @@ export class OmpPiAiAdapter implements ChatAdapter {
         reason: {
           kind: 'aborted',
           failure: ompFailure('ABORTED', 'Model call aborted before send'),
+        },
+        replayState: NONE,
+        observedAttempts: 0,
+      }
+      return
+    }
+
+    if (this.#disposed) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: ompFailure(
+            'REGISTRATION_DISPOSED',
+            'Adapter was disposed while resolving credentials',
+          ),
         },
         replayState: NONE,
         observedAttempts: 0,

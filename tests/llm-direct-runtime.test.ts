@@ -1077,11 +1077,9 @@ describe('openai-completions request projection', () => {
     ])
     expect(messages[1]?.content).toEqual([
       { type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: '\n\n<turn-context>tail context</turn-context>' },
     ])
-    expect(messages[2]).toEqual({
-      role: 'user',
-      content: '<turn-context>tail context</turn-context>',
-    })
+    expect(messages).toHaveLength(2)
   })
 
   test('volatile tail merges into a trailing user message', () => {

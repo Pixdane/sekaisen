@@ -43,6 +43,13 @@ export interface OmpAuthStorageLike {
   readonly keys: {
     resolver(provider: string, options?: OmpAuthResolverOptions): OmpApiKeyResolver
   }
+  /**
+   * Releases the backing credential store. The adapter calls this only for a
+   * store it discovered itself; an injected `authStorage` is borrowed and is
+   * never closed. Real `AuthStorage.close()` is synchronous, but the seam also
+   * accepts an asynchronous implementation.
+   */
+  readonly close?: () => void | Promise<void>
 }
 
 /** Options forwarded to real `discoverAuthStorage()`. */
@@ -57,6 +64,9 @@ export interface OmpDiscoverAuthOptions {
   /** Diagnostics label for the resolved store. */
   readonly sourceLabel?: string
 }
+
+/** Opens the credential store. Injectable as a narrow options seam for tests. */
+export type OmpAuthDiscovery = (options: OmpDiscoverAuthOptions) => Promise<OmpAuthStorageLike>
 
 /**
  * Opens the real local credential store or configured remote broker.

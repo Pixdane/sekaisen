@@ -146,7 +146,7 @@ function buildMessages(
 
   const historyStart = messages.length
   for (const message of request.segment2WarmHistory) {
-    messages.push(convertHistoryMessage(message, snapshot, config))
+    messages.push(convertHistoryMessage(message, snapshot, config, injectCacheMarkers))
   }
   if (injectCacheMarkers && messages.length > historyStart) {
     markCacheBreakpoint(messages[messages.length - 1])
@@ -170,11 +170,30 @@ function shouldInjectCacheMarkers(
   )
 }
 
+/**
+ * Anchor an ephemeral cache breakpoint on the last text block of a warm-history
+ * message. Cache-enabled history is serialized as block arrays (see
+ * {@link convertHistoryMessage}), so the marker lands on the final block and
+ * never on the volatile text appended afterwards.
+ */
 function markCacheBreakpoint(message: Record<string, unknown> | undefined): void {
   if (message === undefined) return
   const content = message.content
-  if (typeof content !== 'string' || content.length === 0) return
-  message.content = [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }]
+  if (typeof content === 'string') {
+    if (content.length === 0) return
+    message.content = [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }]
+    return
+  }
+  if (!Array.isArray(content)) return
+  for (let index = content.length - 1; index >= 0; index -= 1) {
+    const block: unknown = content[index]
+    if (typeof block !== 'object' || block === null) continue
+    const part = block as Record<string, unknown>
+    if (part.type === 'text' && typeof part.text === 'string') {
+      part.cache_control = { type: 'ephemeral' }
+      return
+    }
+  }
 }
 
 function appendVolatileTail(
@@ -191,9 +210,18 @@ function appendVolatileTail(
   }
   const wrapped = `<turn-context>${tail}</turn-context>`
   const last = messages[messages.length - 1]
-  if (last !== undefined && last.role === 'user' && typeof last.content === 'string') {
-    last.content = `${last.content}\n\n${wrapped}`
-    return
+  if (last !== undefined && last.role === 'user') {
+    if (typeof last.content === 'string') {
+      last.content = `${last.content}\n\n${wrapped}`
+      return
+    }
+    if (Array.isArray(last.content)) {
+      // Cache-enabled history is already a block array: merge the turn as an
+      // unmarked block so the warm cache breakpoint stays on the prefix block
+      // and a second consecutive user turn never reaches the wire.
+      last.content = [...last.content, { type: 'text', text: `\n\n${wrapped}` }]
+      return
+    }
   }
   messages.push({ role: 'user', content: wrapped })
 }
@@ -202,10 +230,19 @@ function convertHistoryMessage(
   message: NeutralMessage,
   snapshot: PreparedChatCallSnapshot,
   config: DirectRouteConfig,
+  injectCacheMarkers: boolean,
 ): Record<string, unknown> {
   switch (message.role) {
-    case 'user':
-      return { role: 'user', content: message.content.map((block) => block.text).join('') }
+    case 'user': {
+      const text = message.content.map((block) => block.text).join('')
+      return {
+        role: 'user',
+        // Cache-enabled history keeps one stable block-array shape across turns;
+        // only the warm-end message gains a marker, so its prefix stays
+        // byte-identical when it later becomes an interior message.
+        content: injectCacheMarkers && text.length > 0 ? [{ type: 'text', text }] : text,
+      }
+    }
     case 'tool-result':
       return {
         role: 'tool',
@@ -231,7 +268,9 @@ function convertHistoryMessage(
         role: 'assistant',
         content:
           text.length > 0
-            ? text
+            ? injectCacheMarkers
+              ? [{ type: 'text', text }]
+              : text
             : toolCalls.length > 0
               ? config.gateway === 'deepseek'
                 ? '.'
@@ -334,12 +373,15 @@ function extractErrorMessage(error: unknown): string | undefined {
 function readTokenCount(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined
   const rounded = Math.round(value)
-  return Number.isSafeInteger(rounded) ? rounded : undefined
+  if (!Number.isSafeInteger(rounded)) return undefined
+  // `Math.round(-0)` (and provider-sent `-0`) must reach the protocol guard as
+  // canonical `+0`; the guard rejects negative zero.
+  return rounded === 0 ? 0 : rounded
 }
 
 function readCost(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined
-  return value
+  return value === 0 ? 0 : value
 }
 
 function parseUsage(raw: unknown): DisjointTokenUsage | undefined {

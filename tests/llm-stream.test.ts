@@ -352,6 +352,43 @@ describe('StreamProtocolGuard invalid transitions', () => {
     ).toThrow(InvariantError)
   })
 
+  test('usage rejects negative zero in every count and optional cost field', () => {
+    const guard = new StreamProtocolGuard()
+    guard.accept({ type: 'first-byte' })
+    guard.accept({ type: 'block-start', index: 0, blockType: 'text' })
+    guard.accept({ type: 'block-end', index: 0, block: { type: 'text', text: 'answer' } })
+    const invalidUsages: readonly DisjointTokenUsage[] = [
+      { ...USAGE, inputUncachedTokens: -0 },
+      { ...USAGE, cacheReadTokens: -0 },
+      { ...USAGE, cacheWriteTokens: -0 },
+      { ...USAGE, outputTokens: -0 },
+      { ...USAGE, reasoningTokens: some(-0) },
+      { ...USAGE, authoritativeCostUsd: some(-0) },
+    ]
+    for (const usage of invalidUsages)
+      expect(() => guard.accept({ type: 'usage', usage })).toThrow(InvariantError)
+    guard.accept({ type: 'usage', usage: { ...USAGE, reasoningTokens: some(0) } })
+    guard.accept({
+      type: 'finish',
+      reason: { kind: 'stop' },
+      replayState: NONE,
+      observedAttempts: 1,
+    })
+    guard.end()
+  })
+
+  test('protocol indexes and observedAttempts reject negative zero', () => {
+    const guard = new StreamProtocolGuard()
+    expect(() => guard.accept(errorFinish('TRANSPORT', -0))).toThrow(InvariantError)
+    guard.accept({ type: 'first-byte' })
+    expect(() => guard.accept({ type: 'block-start', index: -0, blockType: 'text' })).toThrow(
+      InvariantError,
+    )
+    guard.accept({ type: 'block-start', index: 0, blockType: 'text' })
+    guard.accept(errorFinish('TRANSPORT', 1))
+    guard.end()
+  })
+
   test('rejects normal finish from init or without content blocks', () => {
     const guard = new StreamProtocolGuard()
     expect(() =>
@@ -1184,4 +1221,10 @@ describe('MockTurn type surface', () => {
     ]
     expect(turns).toHaveLength(7)
   })
+})
+
+test('failure construction canonicalizes a negative-zero retry delay', () => {
+  const result = failure('RATE_LIMIT', 'retry later', { retryAfterMs: some(-0) })
+  if (!isSome(result.retryAfterMs)) throw new Error('missing retry delay')
+  expect(Object.is(result.retryAfterMs.value, 0)).toBe(true)
 })

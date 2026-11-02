@@ -15,8 +15,13 @@ import type {
   ToolValidationError,
 } from './tool-types.ts'
 
-/** OpenAI/Anthropic-compatible tool name pattern and length limit. */
-const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+/**
+ * Portable tool name: 1-64 characters, beginning with an ASCII letter, then
+ * only ASCII letters, digits, "_" or "-". A leading letter keeps provider
+ * prefixes unambiguous and prevents underscore-only aliases (OAuth style)
+ * from colliding with generated names.
+ */
+const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/
 
 /**
  * Fully validate a neutral tool definition before any wire normalization.
@@ -36,7 +41,7 @@ export function validateToolDefinition(tool: NeutralToolDefinition): Result<void
   if (!name.value.isWellFormed()) return err('tool.name must be well-formed Unicode')
   if (!TOOL_NAME_PATTERN.test(name.value)) {
     return err(
-      `tool.name ${JSON.stringify(name.value)} must match ${TOOL_NAME_PATTERN.source} (1-64 ASCII letters, digits, "_" or "-")`,
+      `tool.name ${JSON.stringify(name.value)} must be 1-64 characters long, start with an ASCII letter, and otherwise contain only ASCII letters, digits, "_" or "-"`,
     )
   }
 

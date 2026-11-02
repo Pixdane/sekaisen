@@ -5,8 +5,9 @@
  * The adapter owns a single attempt lifecycle. pi-ai may rotate credentials or
  * endpoints before any replay-unsafe event; as soon as this module forwards
  * `{ type: 'first-byte' }`, a later inference fetch is rejected before send by
- * the probe and a Codex WebSocket replay frame is observed, so the stream
- * terminates once with `TRANSPORT` instead of concatenating two responses.
+ * the probe, and a Codex WebSocket replay frame cancels the call's own signal so
+ * the stream terminates once with `TRANSPORT` instead of concatenating two
+ * responses. Caller cancellation keeps its separate `ABORTED` meaning.
  */
 
 import type { Option } from '@sekaisen/core'
@@ -65,27 +66,34 @@ export interface OmpStreamCall {
   readonly backend: OmpStreamBackend
 }
 
+/** Canonicalizes SDK token counters: safe integers only, and `-0` becomes `+0`. */
 function safeCount(value: unknown): number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? Object.is(value, -0)
+      ? 0
+      : value
+    : 0
+}
+
+/** Canonicalizes an optional finite non-negative protocol measure. */
+function measure(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Object.is(value, -0)
+      ? 0
+      : value
+    : undefined
 }
 
 function usageFrom(usage: PiAiUsage): DisjointTokenUsage {
-  const reasoningTokens =
-    typeof usage.reasoningTokens === 'number' &&
-    Number.isFinite(usage.reasoningTokens) &&
-    usage.reasoningTokens >= 0
-      ? some(usage.reasoningTokens)
-      : NONE
-  const total = usage.cost?.total
-  const authoritativeCostUsd =
-    typeof total === 'number' && Number.isFinite(total) && total >= 0 ? some(total) : NONE
+  const reasoning = measure(usage.reasoningTokens)
+  const costUsd = measure(usage.cost?.total)
   return Object.freeze({
     inputUncachedTokens: safeCount(usage.input),
     cacheReadTokens: safeCount(usage.cacheRead),
     cacheWriteTokens: safeCount(usage.cacheWrite),
     outputTokens: safeCount(usage.output),
-    reasoningTokens,
-    authoritativeCostUsd,
+    reasoningTokens: reasoning === undefined ? NONE : some(reasoning),
+    authoritativeCostUsd: costUsd === undefined ? NONE : some(costUsd),
   })
 }
 
@@ -170,14 +178,56 @@ function errorCarrier(message: AssistantMessage): {
 }
 
 /**
+ * Settles a pending `iterator.next()` when the call is cancelled. Aborting the
+ * producer signal is the only reliable cancel channel: pi-ai routes its probes
+ * through observers that swallow exceptions, so throwing from `onSseEvent` or
+ * `onResponse` cannot stop an in-flight request by itself.
+ */
+const STOP = Symbol('omp-call-stop')
+
+/**
  * Runs one bound backend call and yields exactly one legal stream. Operational
  * failures become a single terminal finish; protocol defects thrown by this
  * module are rethrown as `InvariantError`.
  */
 export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChunk> {
   const { model, context, options, state } = call
-  const signal = options.signal
-  if (isAborted(signal)) {
+  const callerSignal = options.signal
+  // The call owns its producer signal. Caller cancellation is forwarded into
+  // it, and a replay observed after the commit can cancel the transport without
+  // being mistaken for a caller abort. `classifyOmpFailure` keeps receiving the
+  // caller signal, whose `aborted` flag alone means cancellation.
+  const controller = new AbortController()
+  const signal = controller.signal
+  let callerAborted = isAborted(callerSignal)
+  let callEnded = false
+  let stopRequested = false
+  const stopped = Promise.withResolvers<typeof STOP>()
+  const requestStop = (): void => {
+    if (stopRequested) return
+    stopRequested = true
+    stopped.resolve(STOP)
+  }
+  const forwardCallerAbort = (): void => {
+    callerAborted = true
+    controller.abort(callerSignal?.reason)
+    requestStop()
+  }
+  const detachCaller = (): void => {
+    callerSignal?.removeEventListener('abort', forwardCallerAbort)
+  }
+  state.bindReplayCancel(() => {
+    // A late observer callback from an SDK stream this call already closed must
+    // not cancel the (possibly reused) transport of the finished call.
+    if (callEnded) return
+    controller.abort()
+    requestStop()
+  })
+  if (callerSignal !== undefined) {
+    if (callerSignal.aborted) forwardCallerAbort()
+    else callerSignal.addEventListener('abort', forwardCallerAbort, { once: true })
+  }
+  if (callerAborted) {
     yield terminalFailure(
       { kind: 'aborted', failure: ompFailure('ABORTED', 'Model call aborted before send') },
       state,
@@ -187,10 +237,11 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
 
   let iterator: AsyncIterator<AssistantMessageEvent>
   try {
-    iterator = call.backend(model, context, options)[Symbol.asyncIterator]()
+    iterator = call.backend(model, context, { ...options, signal })[Symbol.asyncIterator]()
   } catch (error) {
+    detachCaller()
     yield failureFinish(
-      classifyOmpFailure(error, signal, {
+      classifyOmpFailure(error, callerSignal, {
         api: model.api,
         provider: model.provider,
         secrets: call.secrets,
@@ -209,11 +260,24 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
   let innerClosed = false
   let toolBlocks = 0
 
-  const closeInner = async (): Promise<void> => {
+  /**
+   * Stops the producer before closing it. `cancel` aborts the call signal,
+   * which is what actually reaches the SDK transport (socket, response body,
+   * pending retry). The close is not awaited: a producer that ignores
+   * cancellation must not hold the terminal frame. A normally completed stream
+   * closes without aborting, so a transport the SDK keeps for reuse is not torn
+   * down after its last event.
+   */
+  const closeInner = (cancel = true): void => {
     if (innerClosed) return
     innerClosed = true
+    if (cancel) {
+      controller.abort()
+      requestStop()
+    }
     try {
-      await iterator.return?.()
+      const closing = iterator.return?.()
+      if (closing !== undefined) void Promise.resolve(closing).catch(() => {})
     } catch {
       // The terminal finish already describes the stream outcome; a close
       // failure cannot add information or a legal second frame.
@@ -331,9 +395,28 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
 
   try {
     while (true) {
-      const next = await iterator.next()
-      if (isAborted(signal)) {
-        await closeInner()
+      // A cancelled call must not hang on a producer that never settles, so the
+      // read races the producer against the stop signal. `Promise.race` also
+      // owns the abandoned read, so its later rejection is not unhandled.
+      const next = await Promise.race([iterator.next(), stopped.promise])
+      if (next === STOP) {
+        closeInner()
+        yield callerAborted
+          ? terminalFailure(
+              { kind: 'aborted', failure: ompFailure('ABORTED', 'Model call aborted by caller') },
+              state,
+            )
+          : failureFinish(
+              ompFailure(
+                'TRANSPORT',
+                'Upstream attempted a replay after the response had already produced output',
+              ),
+              state,
+            )
+        return
+      }
+      if (callerAborted) {
+        closeInner()
         yield terminalFailure(
           { kind: 'aborted', failure: ompFailure('ABORTED', 'Model call aborted by caller') },
           state,
@@ -343,7 +426,7 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
       if (next.done === true) break
       const event = next.value
       if (state.postCommitAttempt && firstByteSent) {
-        await closeInner()
+        closeInner()
         yield failureFinish(
           ompFailure(
             'TRANSPORT',
@@ -443,22 +526,22 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
               ? { kind: 'max-tokens' }
               : { kind: 'stop' }
         finished = true
-        await closeInner()
+        closeInner(false)
         yield terminalFailure(reason, state, replayState)
         return
       }
 
       if (event.type === 'error') {
-        await closeInner()
+        closeInner()
         const failure =
-          event.reason === 'aborted' || isAborted(signal)
+          callerAborted || event.reason === 'aborted'
             ? ompFailure('ABORTED', 'Model call aborted by caller')
             : state.postCommitAttempt
               ? ompFailure(
                   'TRANSPORT',
                   'Upstream attempted a replay after the response had already produced output',
                 )
-              : classifyOmpFailure(errorCarrier(event.error), signal, {
+              : classifyOmpFailure(errorCarrier(event.error), callerSignal, {
                   api: model.api,
                   provider: model.provider,
                   secrets: call.secrets,
@@ -546,8 +629,8 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
       }
     }
 
-    await closeInner()
-    if (isAborted(signal)) {
+    closeInner()
+    if (callerAborted) {
       yield terminalFailure(
         { kind: 'aborted', failure: ompFailure('ABORTED', 'Model call aborted by caller') },
         state,
@@ -560,15 +643,15 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
     )
   } catch (cause) {
     if (cause instanceof InvariantError) throw cause
-    await closeInner()
-    const failure = isAborted(signal)
+    closeInner()
+    const failure = callerAborted
       ? ompFailure('ABORTED', 'Model call aborted by caller')
       : state.postCommitAttempt
         ? ompFailure(
             'TRANSPORT',
             'Upstream attempted a replay after the response had already produced output',
           )
-        : classifyOmpFailure(cause, signal, {
+        : classifyOmpFailure(cause, callerSignal, {
             api: model.api,
             provider: model.provider,
             secrets: call.secrets,
@@ -577,6 +660,8 @@ export async function* runOmpCall(call: OmpStreamCall): AsyncIterable<StreamChun
     finished = true
     yield failureFinish(failure, state)
   } finally {
-    if (!finished) await closeInner()
+    callEnded = true
+    detachCaller()
+    if (!finished) closeInner()
   }
 }

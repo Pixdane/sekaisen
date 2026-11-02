@@ -66,7 +66,11 @@ const adapter = await OmpPiAiAdapter.create({
 })
 ```
 
-The bridge discovers the existing OMP auth store/broker (or accepts an injected store), delegates pre-output account recovery to pi-ai, and reports probe-observed inference attempts over the SDK's HTTP and Codex WebSocket paths, rejecting inference replay after the first semantic frame. That count covers only traffic visible through pi-ai's injected `fetch` / `onResponse` / `onSseEvent` seams; inference-URL matching is heuristic, so uncovered paths can only under-count, and an SDK transport that bypasses those seams needs new evidence and adapter-specific tests. OAuth/SDK types stay outside the neutral package. Tests use injected transports and auth stores; they do not read local credentials, open a real Codex socket, or call paid models.
+The in-process OMP bridge implements chat only. Register `DirectEmbeddingAdapter` / `DirectRerankAdapter` separately for retrieval (for example SiliconFlow or OpenRouter); the HTTP OMP gateway is a separate direct-transport option, not an in-process retrieval bridge.
+
+The Cordis plugin closes auth storage it discovers when its fiber unloads or registration fails. Manually managed adapters must be disposed with `await adapter.dispose()` at shutdown. Injected `authStorage` remains caller-owned and is never closed by the adapter; the static `resolveApiKey` path opens no auth store.
+
+The bridge discovers the existing OMP auth store/broker (or accepts an injected store), delegates pre-output recovery to pi-ai, and counts inference POSTs observed through its injected fetch seam (including custom, Ollama, and Bedrock endpoints), excluding known auth/probe traffic. Post-commit replay synchronously aborts a per-call child signal and terminates with `TRANSPORT`; caller cancellation remains `ABORTED`. Default Codex calls use SSE because the bridge does not supply SDK provider session state; the WS observer is defense-in-depth, supported by source-order and injected-callback checks rather than a real-socket test. SDK transports bypassing these seams or new auxiliary endpoints need new acceptance evidence. OAuth/SDK types stay outside the neutral package; tests do not read local credentials or call paid models.
 
 Validation: `bun run typecheck`, `bun test`, `bun run check`. The shared `@sekaisen/plugin-llm/testing` conformance runner exercises text, tools, truncation, HTTP failures, interrupted tools, pre-send cancellation, and empty responses across both adapter families.
 

@@ -74,10 +74,18 @@ function readNonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 && value.isWellFormed() ? value : undefined
 }
 
-function readCount(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
-  const truncated = Math.trunc(value)
-  return Number.isSafeInteger(truncated) ? truncated : Number.MAX_SAFE_INTEGER
+/**
+ * Read one provider token count. An absent (or null) field counts as zero; a
+ * present value that is not a finite non-negative number rounding to a safe
+ * integer makes the whole usage record unusable, because clamping it would
+ * emit a count the stream protocol guard rejects.
+ */
+function readCount(value: unknown): number | undefined {
+  if (value === undefined || value === null) return 0
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined
+  const rounded = Math.round(value)
+  if (!Number.isSafeInteger(rounded)) return undefined
+  return rounded === 0 ? 0 : rounded
 }
 
 function readIndex(value: unknown): number | undefined {
@@ -88,27 +96,42 @@ function parseUsage(raw: unknown): DisjointTokenUsage | undefined {
   if (!isPlainRecord(raw)) return undefined
   const input = readCount(raw.input_tokens)
   const details = isPlainRecord(raw.input_tokens_details) ? raw.input_tokens_details : undefined
-  const cacheRead = Math.min(readCount(details?.cached_tokens), input)
+  const cached = readCount(details?.cached_tokens)
   const output = readCount(raw.output_tokens)
   const outputDetails = isPlainRecord(raw.output_tokens_details)
     ? raw.output_tokens_details
     : undefined
   const reasoningRaw = outputDetails?.reasoning_tokens
-  const reasoningTokens: Option<number> =
-    typeof reasoningRaw === 'number' && Number.isFinite(reasoningRaw) && reasoningRaw >= 0
-      ? some(readCount(reasoningRaw))
-      : NONE
+  let reasoning: Option<number> | undefined = NONE
+  if (reasoningRaw !== undefined && reasoningRaw !== null) {
+    const count = readCount(reasoningRaw)
+    reasoning = count === undefined ? undefined : some(count)
+  }
   const costRaw = raw.cost
   const cost =
-    typeof costRaw === 'number' && Number.isFinite(costRaw) && costRaw >= 0
-      ? some(costRaw === 0 ? 0 : costRaw)
-      : NONE
+    costRaw === undefined || costRaw === null
+      ? NONE
+      : typeof costRaw === 'number' && Number.isFinite(costRaw) && costRaw >= 0
+        ? some(costRaw === 0 ? 0 : costRaw)
+        : undefined
+  if (
+    input === undefined ||
+    cached === undefined ||
+    output === undefined ||
+    reasoning === undefined ||
+    cost === undefined
+  ) {
+    // Omit the usage frame, matching the completions decoder: a malformed
+    // upstream record must never reach the stream guard.
+    return undefined
+  }
+  const cacheRead = Math.min(cached, input)
   return {
     inputUncachedTokens: input - cacheRead,
     cacheReadTokens: cacheRead,
     cacheWriteTokens: 0,
     outputTokens: output,
-    reasoningTokens,
+    reasoningTokens: reasoning,
     authoritativeCostUsd: cost,
   }
 }

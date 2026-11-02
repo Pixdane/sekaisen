@@ -663,7 +663,9 @@ function readTokenCount(value: unknown, label: string): number | undefined {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     throw malformed(`upstream usage.${label} is not a non-negative safe integer`)
   }
-  return value
+  // The protocol guard rejects negative zero, so normalize it before it can
+  // reach an emitted usage frame.
+  return value === 0 ? 0 : value
 }
 
 function readUsage(raw: unknown): UsagePatch | undefined {
@@ -689,7 +691,9 @@ function readUsage(raw: unknown): UsagePatch | undefined {
   const reasoning = readTokenCount(raw.reasoning_output_tokens, 'reasoning_output_tokens')
   if (reasoning !== undefined) patch.reasoning = reasoning
   const cost = raw.cost
-  if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) patch.cost = cost
+  if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+    patch.cost = cost === 0 ? 0 : cost
+  }
   return Object.keys(patch).length === 0 ? undefined : patch
 }
 

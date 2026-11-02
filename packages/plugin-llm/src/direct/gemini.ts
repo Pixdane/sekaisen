@@ -65,31 +65,53 @@ function readNonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 && value.isWellFormed() ? value : undefined
 }
 
-function readCount(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
-  const truncated = Math.trunc(value)
-  return Number.isSafeInteger(truncated) ? truncated : Number.MAX_SAFE_INTEGER
+/**
+ * Read one provider token count. An absent (or null) field counts as zero; a
+ * present value that is not a finite non-negative number rounding to a safe
+ * integer makes the whole usage record unusable, because clamping it would
+ * emit a count the stream protocol guard rejects.
+ */
+function readCount(value: unknown): number | undefined {
+  if (value === undefined || value === null) return 0
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined
+  const rounded = Math.round(value)
+  if (!Number.isSafeInteger(rounded)) return undefined
+  return rounded === 0 ? 0 : rounded
 }
 
 function parseUsage(raw: unknown): DisjointTokenUsage | undefined {
   if (!isPlainRecord(raw)) return undefined
   const prompt = readCount(raw.promptTokenCount)
-  const cacheRead = Math.min(readCount(raw.cachedContentTokenCount), prompt)
+  const cached = readCount(raw.cachedContentTokenCount)
   const candidates = readCount(raw.candidatesTokenCount)
   const thoughtsRaw = raw.thoughtsTokenCount
-  const thoughts = readCount(thoughtsRaw)
+  const thoughts = thoughtsRaw === undefined || thoughtsRaw === null ? 0 : readCount(thoughtsRaw)
   const total = readCount(raw.totalTokenCount)
+  if (
+    prompt === undefined ||
+    cached === undefined ||
+    candidates === undefined ||
+    thoughts === undefined ||
+    total === undefined
+  ) {
+    // Omit the usage frame, matching the completions decoder: a malformed
+    // upstream record must never reach the stream guard.
+    return undefined
+  }
+  // Gemini reports thoughts outside `candidatesTokenCount`; the summed output
+  // must still be a safe integer before it can be emitted.
+  const outputTokens = candidates + thoughts
+  if (!Number.isSafeInteger(outputTokens)) return undefined
+  const cacheRead = Math.min(cached, prompt)
   const inputUncachedTokens =
     prompt > 0 ? prompt - cacheRead : Math.max(0, total - candidates - thoughts)
   const reasoningTokens: Option<number> =
-    typeof thoughtsRaw === 'number' && Number.isFinite(thoughtsRaw) && thoughtsRaw >= 0
-      ? some(thoughts)
-      : NONE
+    thoughtsRaw === undefined || thoughtsRaw === null ? NONE : some(thoughts)
   return {
     inputUncachedTokens,
     cacheReadTokens: cacheRead,
     cacheWriteTokens: 0,
-    outputTokens: candidates + thoughts,
+    outputTokens,
     reasoningTokens,
     authoritativeCostUsd: NONE,
   }

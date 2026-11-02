@@ -1,6 +1,7 @@
 import { InvariantError } from '@sekaisen/core'
 import { normalizeDefaultValue } from './tool-decode.ts'
 import {
+  canonicalJsonNumber,
   defineData,
   isFiniteNumber,
   isNonNegativeInteger,
@@ -351,25 +352,26 @@ function makeLiteral<
   D extends boolean,
 >(state: ModifierState, value: V): ToolLiteralBuilder<V, O, N, D> {
   assertLiteralValue(value)
+  const stored = (typeof value === 'number' ? canonicalJsonNumber(value) : value) as V
   const fields = Object.freeze({
     kind: 'literal' as const,
     ...modifierFields<unknown>(state),
-    value,
+    value: stored,
   })
   const node = fields as unknown as ToolSchemaNode
   return Object.freeze({
     ...fields,
     desc(description: string): ToolLiteralBuilder<V, O, N, D> {
-      return makeLiteral<V, O, N, D>(withDescription(state, description), value)
+      return makeLiteral<V, O, N, D>(withDescription(state, description), stored)
     },
     optional(): ToolLiteralBuilder<V, true, N, D> {
-      return makeLiteral<V, true, N, D>(withOptional(state), value)
+      return makeLiteral<V, true, N, D>(withOptional(state), stored)
     },
     nullable(): ToolLiteralBuilder<V, O, true, D> {
-      return makeLiteral<V, O, true, D>(withNullable(state), value)
+      return makeLiteral<V, O, true, D>(withNullable(state), stored)
     },
     default(value_: unknown): ToolLiteralBuilder<V, O, N, true> {
-      return makeLiteral<V, O, N, true>(withDefault(state, node, value_), value)
+      return makeLiteral<V, O, N, true>(withDefault(state, node, value_), stored)
     },
   }) as unknown as ToolLiteralBuilder<V, O, N, D>
 }

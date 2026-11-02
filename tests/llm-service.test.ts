@@ -642,6 +642,80 @@ describe('llm/stream waterfall', () => {
     expect(chunks.at(-1)?.type).toBe('finish')
   })
 
+  test.each(['remove', 'insert'] as const)(
+    'a listener may %s blocks only with a matching replay envelope',
+    async (mode) => {
+      for (const alignReplay of [true, false]) {
+        const { ctx, service } = setup()
+        const adapter = new MockAdapter({
+          emitReplayState: true,
+          turns: [{ kind: 'text', reasoning: 'plan', text: 'answer' }],
+        })
+        expectOk(service.registerChatAdapter([ROUTE], adapter))
+        ctx.on('llm/stream', (_prepared, next) =>
+          (async function* (): AsyncIterable<StreamChunk> {
+            for await (const chunk of next()) {
+              if (chunk.type === 'first-byte') {
+                yield chunk
+                if (mode === 'insert') {
+                  yield { type: 'block-start', index: 0, blockType: 'text' }
+                  yield { type: 'text-delta', index: 0, delta: 'prefix' }
+                  yield { type: 'block-end', index: 0, block: { type: 'text', text: 'prefix' } }
+                }
+              } else if ('index' in chunk) {
+                if (mode === 'remove' && chunk.index === 0) continue
+                yield { ...chunk, index: chunk.index + (mode === 'insert' ? 1 : -1) }
+              } else if (chunk.type === 'finish' && alignReplay && isSome(chunk.replayState)) {
+                const replay = chunk.replayState.value
+                if (replay.blocks === undefined) throw new Error('mock replay blocks missing')
+                yield {
+                  ...chunk,
+                  replayState: some({
+                    ...replay,
+                    blocks:
+                      mode === 'remove'
+                        ? replay.blocks.slice(1)
+                        : [{ local: 'prefix' }, ...replay.blocks],
+                  }),
+                }
+              } else {
+                yield chunk
+              }
+            }
+          })(),
+        )
+        try {
+          const stream = expectOk(prepare(service)).stream(new AbortController().signal)
+          if (!alignReplay) {
+            await expect(collect(stream)).rejects.toThrow(InvariantError)
+            continue
+          }
+          const chunks = await collect(stream)
+          expect(
+            chunks.filter((chunk) => chunk.type === 'block-end').map((chunk) => chunk.block),
+          ).toEqual(
+            mode === 'remove'
+              ? [{ type: 'text', text: 'answer' }]
+              : [
+                  { type: 'text', text: 'prefix' },
+                  { type: 'reasoning', text: 'plan' },
+                  { type: 'text', text: 'answer' },
+                ],
+          )
+          const finish = chunks.at(-1)
+          if (finish?.type !== 'finish' || !isSome(finish.replayState))
+            throw new Error('missing replay finish')
+          expect(finish.reason.kind).toBe('stop')
+          expect(finish.replayState.value.blocks).toEqual(
+            mode === 'remove' ? [{ index: 1 }] : [{ local: 'prefix' }, { index: 0 }, { index: 1 }],
+          )
+        } finally {
+          await ctx.fiber.dispose()
+        }
+      }
+    },
+  )
+
   test('a listener may short-circuit without calling next', async () => {
     const { ctx, service } = setup()
     const adapter = new MockAdapter()
@@ -951,7 +1025,7 @@ class EmbeddingFixture implements EmbeddingAdapter {
     return {
       ok: true,
       value: {
-        vectors: this.source.map((vector) => new Float32Array(vector)),
+        vectors: this.source,
         totalPromptTokens: some(3),
       },
     }
@@ -982,6 +1056,8 @@ describe('embedding and rerank plumbing', () => {
   test('resolves profiles, forwards dimensions and copies vectors', async () => {
     const { service } = setup()
     const embedding = new EmbeddingFixture()
+    const shared = new Float32Array([1, 2, 3, 4])
+    embedding.source = [shared.subarray(0, 3), shared.subarray(1, 4)]
     expectOk(service.registerEmbeddingAdapter([ROUTE], embedding))
     expectOk(
       service.configureProfiles({
@@ -1000,8 +1076,14 @@ describe('embedding and rerank plumbing', () => {
     expect(result.vectors[0]).not.toBe(embedding.source[0])
     expect(result.vectors[0]?.buffer).not.toBe(result.vectors[1]?.buffer)
     const first = result.vectors[0]
-    if (first !== undefined) first[0] = 99
-    expect(embedding.source[0]?.[0]).toBe(1)
+    const second = result.vectors[1]
+    if (first === undefined || second === undefined) throw new Error('missing embedding vector')
+    first[1] = 99
+    expect(shared[1]).toBe(2)
+    expect(second[0]).toBe(2)
+    shared[2] = 77
+    expect(first[2]).toBe(3)
+    expect(second[1]).toBe(3)
     expect(result.totalPromptTokens).toEqual(some(3))
   })
 

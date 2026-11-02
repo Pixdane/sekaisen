@@ -51,7 +51,12 @@ export function createDataObject(nullPrototype: boolean): Record<string, unknown
 /*                            JSON value utilities                            */
 /* -------------------------------------------------------------------------- */
 
-/** Deep clone frozen JSON data, preserving null-prototype dictionaries. */
+/**
+ * Deep clone frozen JSON data, preserving null-prototype dictionaries and
+ * canonicalizing `-0` to `+0`. Own object entries whose value is `undefined`
+ * are omitted: object decoding treats a present `undefined` as absent, so a
+ * handwritten default with such an entry must not leak an undefined key.
+ */
 export function cloneJsonValue(value: unknown): unknown {
   if (value === null) return null
   if (Array.isArray(value)) {
@@ -63,13 +68,22 @@ export function cloneJsonValue(value: unknown): unknown {
     const out = createDataObject(Object.getPrototypeOf(value) === null)
     for (const key of Object.keys(value)) {
       const own = readOwn(value, key)
-      if (own.present) defineData(out, key, cloneJsonValue(own.value))
+      if (!own.present || own.value === undefined) continue
+      defineData(out, key, cloneJsonValue(own.value))
     }
     return Object.freeze(out)
   }
-  const type = typeof value
-  if (type === 'string' || type === 'boolean' || type === 'number') return value
+  if (typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') return canonicalJsonNumber(value)
   throw new InvariantError('tool schema values must be JSON data')
+}
+
+/**
+ * JSON has no negative zero: canonicalize `-0` to `+0` so decoded and cloned
+ * numbers are stable under `Object.is` and deep equality checks.
+ */
+export function canonicalJsonNumber(value: number): number {
+  return value === 0 ? 0 : value
 }
 
 /** Compact JSON rendering used inside descriptions and error messages. */

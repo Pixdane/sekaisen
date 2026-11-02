@@ -42,10 +42,17 @@ function supportsRetrieval(protocol: DirectProtocol): boolean {
   return protocol === 'openai-completions' || protocol === 'openai-responses'
 }
 
+/**
+ * Read one provider token count. An absent or malformed value yields no usage
+ * (the adapter omits it) instead of clamping; a provider-sent `-0` (or
+ * `Math.round(-0)`) is normalized to canonical `+0` because the service-side
+ * `validSafeCount` rejects negative zero.
+ */
 function readTokenCount(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined
   const rounded = Math.round(value)
-  return Number.isSafeInteger(rounded) ? rounded : undefined
+  if (!Number.isSafeInteger(rounded)) return undefined
+  return rounded === 0 ? 0 : rounded
 }
 
 function abortedFailure(): LlmFailure {
@@ -237,7 +244,9 @@ export class DirectEmbeddingAdapter implements EmbeddingAdapter {
       ) {
         return err(failure('MALFORMED_RESPONSE', 'embedding vector index was out of range'))
       }
-      const position = index as number
+      // `-0` passes every range check above but would fail the service
+      // validator, so the mapped position is canonicalized before use.
+      const position = index === 0 ? 0 : (index as number)
       if (assigned[position]) {
         return err(failure('MALFORMED_RESPONSE', `embedding response duplicated index ${position}`))
       }
@@ -368,7 +377,9 @@ export class DirectRerankAdapter implements RerankAdapter {
       ) {
         return err(failure('MALFORMED_RESPONSE', 'rerank result index was out of range'))
       }
-      const position = index as number
+      // `-0` passes every range check above but would fail the service
+      // validator, so the returned score index is canonicalized before use.
+      const position = index === 0 ? 0 : (index as number)
       if (seen.has(position)) {
         return err(failure('MALFORMED_RESPONSE', `rerank response duplicated index ${position}`))
       }
