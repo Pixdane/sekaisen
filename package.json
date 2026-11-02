@@ -13,6 +13,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.2",
+    "@sekaisen/plugin-llm": "workspace:*",
+    "@sekaisen/plugin-llm-omp": "workspace:*",
     "@sekaisen/plugin-perspective": "workspace:*",
     "@sekaisen/plugin-world-model": "workspace:*",
     "@types/bun": "1.3.14",
